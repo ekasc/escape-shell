@@ -11,10 +11,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { motion, render } from '@gpuix/react'
 
-import { createEscapeAgentClient, createLocalAgentClient } from './agent-client'
+import { createEscapeAgentClient, createLocalAgentClient, TRANSCRIPT_PAGE } from './agent-client'
 import { matchCommand, SHORTCUTS } from './shortcuts'
 import type { KeyEventLike, WindowCommand } from './shortcuts'
-import type { AgentClient, CommandSummary, MemorySnapshot, ProviderSummary, SessionStats, SessionSummary, SessionTreeNode, SkillProject, SkillScope, SkillSummary } from './agent-client'
+import type { AgentClient, CommandSummary, Diagnostics, MemorySnapshot, ProviderSummary, SessionStats, SessionSummary, SessionTreeNode, SkillProject, SkillScope, SkillSummary } from './agent-client'
 
 import iconActivity from './assets/icons/activity.svg' with { type: 'text' }
 import iconArrowLeft from './assets/icons/arrow-left.svg' with { type: 'text' }
@@ -186,11 +186,11 @@ type PendingInteraction =
 
 
 const VERSION = '0.1.0'
-const HELP_TEXT = 'Escape commands: review, recap, last-response, /model, /reasoning, /permissions, /diff, /compact, /snapcompact, /export, /undo, /fork, /clone, /steer, /followup, /status, /stop.'
+const HELP_TEXT = 'review, recap, last-response, /model, /reasoning, /permissions, /diff, /compact, /snapcompact, /export, /undo, /fork, /clone, /steer, /followup, /status, /stop'
 const REVIEW_PROMPT = 'Review the current uncommitted changes in the workspace. Do not modify files. Identify bugs, regressions, security issues, and missing tests. Start with a concise summary and cite relevant file paths.'
 const BUILTIN_COMMANDS: CommandSummary[] = [
-  { name: 'help', description: 'Show Escape command help' },
-  { name: 'version', description: 'Show the Escape version' },
+  { name: 'help', description: 'Show command help' },
+  { name: 'version', description: 'Show the version' },
   { name: 'review', description: 'Review uncommitted workspace changes' },
   { name: 'recap', description: 'Summarize the current session' },
   { name: 'last-response', description: 'Show the last persisted assistant response' },
@@ -1070,36 +1070,6 @@ function SettingsAction({
 
 const DRAFT_SESSION_KEY = '__draft__'
 
-// t3code renders a ProjectFavicon per project. Escape has no image assets, so
-// derive a stable colored monogram from the project path instead.
-function projectMark(path: string, name: string): { letter: string; color: string } {
-  let hash = 0
-  for (let i = 0; i < path.length; i++) hash = (hash * 31 + path.charCodeAt(i)) >>> 0
-  const hue = hash % 360
-  const letter = (name[0] ?? '?').toUpperCase()
-  return { letter, color: `hsl(${hue} 55% 62%)` }
-}
-
-function ProjectMark({ path, name, size = 16 }: { path: string; name: string; size?: number }) {
-  const mark = projectMark(path, name)
-  return (
-    <div
-      style={{
-        width: size,
-        height: size,
-        borderRadius: Math.max(4, Math.round(size / 4)),
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        backgroundColor: mark.color,
-        flexShrink: 0,
-      }}
-    >
-      <text style={{ fontSize: Math.round(size * 0.62), fontWeight: 700, fontFamily: FONT, color: '#0B0D0F' }}>{mark.letter}</text>
-    </div>
-  )
-}
-
 function basenameOf(path: string): string {
   const parts = path.split('/').filter(Boolean)
   if (parts.length === 0) return 'Workspace'
@@ -1134,7 +1104,7 @@ const SETTINGS_SECTION_COPY: Record<SettingsSectionId, { title: string; hint: st
     title: 'Memory',
     hint: 'Notes the agent keeps for this project. They survive session end and are never compacted, so anything important belongs here rather than in a transcript.',
   },
-  approvals: { title: 'Approvals and queue', hint: 'When Escape asks, and how queued messages are handled.' },
+  approvals: { title: 'Approvals and queue', hint: 'When the agent asks, and how queued messages are handled.' },
   account: { title: 'Account', hint: 'Keys are saved by the engine in a private credential store, never in the app.' },
   diagnostics: { title: 'Diagnostics', hint: 'Engine connectivity and session usage.' },
   developer: { title: 'Developer tools', hint: 'Diff, compaction, history, and direct shell access.' },
@@ -1144,7 +1114,7 @@ const SETTINGS_SECTION_COPY: Record<SettingsSectionId, { title: string; hint: st
   },
   keyboard: {
     title: 'Keyboard',
-    hint: 'Escape has no menu bar, so these are the complete set of window commands. The command palette searches commands and sessions.',
+    hint: 'There is no menu bar, so these are the complete set of window commands.',
   },
 }
 
@@ -1185,6 +1155,10 @@ function SettingsPanel({
   connectionStatus,
   runtimeState,
   onPing,
+  diagnostics,
+  diagnosticsStatus,
+  onCaptureDiagnostics,
+  onSaveDiagnostics,
   onExport,
   onForkLatest,
   onForkEntry,
@@ -1264,6 +1238,10 @@ function SettingsPanel({
   connectionStatus: string
   runtimeState: string
   onPing: () => void
+  diagnostics: Diagnostics | null
+  diagnosticsStatus: string
+  onCaptureDiagnostics: () => void
+  onSaveDiagnostics: () => void
   onExport: () => void
   onForkLatest: () => void
   onForkEntry: (entryId: string) => void
@@ -1746,7 +1724,7 @@ function SettingsPanel({
 
       {section === 'approvals' ? (
         <SettingsCard>
-          <SettingsRow label="Approval mode" description="Whether Escape pauses for tool approval." testId="settings-row-approval" column>
+          <SettingsRow label="Approval mode" description="Whether tool approval is required." testId="settings-row-approval" column>
             <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
               <SettingChip testId="approval-mode-auto" label="auto" active={approvalMode === 'auto'} onClick={() => onApprovalMode('auto')} />
               <SettingChip testId="approval-mode-ask" label="ask" active={approvalMode === 'ask'} onClick={() => onApprovalMode('ask')} />
@@ -1773,7 +1751,7 @@ function SettingsPanel({
 
       {section === 'account' ? (
         <SettingsCard>
-          <SettingsRow label="Sign in with" description="Escape stores the result in its own credential store." testId="settings-row-login-provider" column>
+          <SettingsRow label="Sign in with" description="Stored in its own credential store." testId="settings-row-login-provider" column>
             <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
               <SettingChip testId="login-provider-opencode-go" label="opencode-go" active={loginProvider === 'opencode-go'} onClick={() => onLoginProvider('opencode-go')} />
               <SettingChip testId="login-provider-opencode-zen" label="opencode-zen" active={loginProvider === 'opencode-zen'} onClick={() => onLoginProvider('opencode-zen')} />
@@ -1793,6 +1771,41 @@ function SettingsPanel({
             <text testId="runtime-state" style={{ fontSize: 11, fontFamily: FONT, color: C.tertiary }}>{`Engine state: ${runtimeState || 'unknown'}`}</text>
             <SettingsAction label="Test connection" testId="ping-engine" onClick={onPing} />
             {connectionStatus ? <text testId="connection-status" style={{ fontSize: 11, fontFamily: FONT, color: C.secondary }}>{connectionStatus}</text> : null}
+          </SettingsRow>
+          <SettingsRow
+            label="Turn timings"
+            description="Measured by the engine on every turn. Read and build grow with the session; first token is the network and the model."
+            testId="settings-row-timings"
+            column
+          >
+            <SettingsAction label={diagnostics ? 'Refresh timings' : 'Read timings'} testId="capture-diagnostics" onClick={onCaptureDiagnostics} />
+            <SettingsAction label="Save report" testId="save-diagnostics" onClick={onSaveDiagnostics} />
+            {diagnosticsStatus ? <text testId="diagnostics-status" style={{ fontSize: 11, fontFamily: FONT, color: C.secondary }}>{diagnosticsStatus}</text> : null}
+            {diagnostics ? (
+              <div testId="diagnostics-timings" style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
+                <text style={{ fontSize: 11, fontFamily: FONT, color: C.tertiary }}>
+                  {`${diagnostics.model ?? 'unknown model'} on ${diagnostics.provider ?? 'unknown provider'} · thinking ${diagnostics.thinkingLevel || 'unset'} · ${diagnostics.skills ?? 0} skills · ${diagnostics.tools ?? 0} tools`}
+                </text>
+                <text style={{ fontSize: 11, fontFamily: MONO_FONT, color: C.secondary }}>
+                  {`first token p50 ${diagnostics.firstTokenP50Ms ?? 0}ms · p95 ${diagnostics.firstTokenP95Ms ?? 0}ms · context window ${diagnostics.contextWindow ?? 0}`}
+                </text>
+                {diagnostics.sessionSizeBytes ? (
+                  <text style={{ fontSize: 11, fontFamily: MONO_FONT, color: C.tertiary }}>
+                    {`session ${diagnostics.sessionEntries ?? 0} entries · ${Math.round(diagnostics.sessionSizeBytes / 1024)} KB`}
+                  </text>
+                ) : null}
+                {diagnostics.lastError ? (
+                  <text testId="diagnostics-error" style={{ fontSize: 11, fontFamily: MONO_FONT, color: C.error }}>{`last error: ${diagnostics.lastError}`}</text>
+                ) : null}
+                {(diagnostics.turns ?? []).slice(-6).map((turn, index) => (
+                  <text key={index} style={{ fontSize: 11, fontFamily: MONO_FONT, color: C.tertiary }}>
+                    {`#${(diagnostics.turns ?? []).length - Math.min((diagnostics.turns ?? []).length, 6) + index + 1} read ${turn.historyReadMs ?? 0}ms · build ${turn.buildMs ?? 0}ms · 1st ${turn.firstTokenMs ?? 0}ms · total ${turn.totalMs ?? 0}ms${turn.error ? ' · error' : ''}`}
+                  </text>
+                ))}
+              </div>
+            ) : (
+              <text testId="diagnostics-empty" style={{ fontSize: 11, fontFamily: FONT, color: C.tertiary }}>No timings read yet.</text>
+            )}
           </SettingsRow>
           {stats ? (
             <SettingsRow label="Session usage" description="Counted from the persisted transcript." testId="settings-row-stats" column>
@@ -1904,12 +1917,12 @@ function InteractionCard({
       }}
     >
       <text style={{ fontSize: 12, fontWeight: 700, fontFamily: FONT, color: isApproval ? C.accent : C.purple }}>
-        {isApproval ? 'Approval required' : 'Escape has a question'}
+        {isApproval ? 'Approval required' : 'Question'}
       </text>
       {isApproval ? (
         <>
           <text style={{ marginTop: 5, fontSize: 13, lineHeight: 19, fontFamily: FONT, color: C.text, whiteSpace: 'normal' }}>
-            Allow Escape to run {interaction.toolName}?
+            Allow this to run {interaction.toolName}?
           </text>
           <div style={{ display: 'flex', flexDirection: 'row', gap: 8, marginTop: 12 }}>
             <div
@@ -1944,7 +1957,7 @@ function InteractionCard({
           <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 }}>
             <input
               testId="question-input"
-              aria-label="Answer Escape"
+              aria-label="Answer"
               value={answer}
               placeholder="Type your answer..."
               onChange={(event) => setAnswer(event.value ?? '')}
@@ -2134,7 +2147,7 @@ function Composer({
         >
           <div style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: C.warning }} />
           <text style={{ flexGrow: 1, fontSize: 11.5, lineHeight: 16, fontFamily: FONT, color: C.secondary, whiteSpace: 'normal' }}>
-            {`Sending here will stop "${runningAgentName}" — Escape runs one agent at a time.`}
+            {`Sending here will stop "${runningAgentName}". One agent runs at a time.`}
           </text>
         </div>
       ) : null}
@@ -2156,9 +2169,9 @@ function Composer({
       >
         <input
           testId="chat-input"
-          aria-label="Message Escape"
+          aria-label="Message"
           value={draft}
-          placeholder="Ask Escape anything..."
+          placeholder="Ask anything..."
           autoFocus
           onChange={(event) => onChange(event.value ?? '')}
           onSubmit={() => onSubmit(draft)}
@@ -2174,7 +2187,7 @@ function Composer({
         <div
           testId={busy ? 'stop-message' : 'send-message'}
           role="button"
-          aria-label={busy ? 'Stop Escape' : 'Send message'}
+          aria-label={busy ? 'Stop' : 'Send message'}
           tabIndex={0}
           onClick={action}
           onKeyDown={(event) => runButtonKey(event, action)}
@@ -2215,7 +2228,7 @@ function Composer({
           {busy ? <div testId="steer-message" role="button" aria-label="Steer current turn" tabIndex={0} onClick={onSteer} onKeyDown={(event) => runButtonKey(event, onSteer)} style={{ paddingTop: 4, paddingRight: 7, paddingBottom: 4, paddingLeft: 7, borderRadius: 6, backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, cursor: 'pointer', active: { backgroundColor: C.raisedStrong } }}><text style={{ fontSize: 11, fontFamily: FONT, color: C.secondary }}>Steer</text></div> : null}
           {busy ? <div testId="follow-up-message" role="button" aria-label="Queue follow-up" tabIndex={0} onClick={onFollowUp} onKeyDown={(event) => runButtonKey(event, onFollowUp)} style={{ paddingTop: 4, paddingRight: 7, paddingBottom: 4, paddingLeft: 7, borderRadius: 6, backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, cursor: 'pointer', active: { backgroundColor: C.raisedStrong } }}><text style={{ fontSize: 11, fontFamily: FONT, color: C.secondary }}>Follow up</text></div> : null}
           <text style={{ fontSize: 11, fontFamily: FONT, color: C.ghost }}>
-            {mode === 'engine' ? 'Escape engine' : 'Local preview'}
+            {mode === 'engine' ? 'Engine' : 'Local preview'}
           </text>
         </div>
       </div>
@@ -2261,6 +2274,11 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
   // Running agents are tracked per session so the sidebar can show more than
   // one working agent, and a non-session draft uses DRAFT_SESSION_KEY.
   const [running, setRunning] = useState<Record<string, boolean>>({})
+  // Older transcript pages are fetched on demand rather than all at once, so
+  // opening a long session costs one page instead of the whole conversation.
+  const [olderCursor, setOlderCursor] = useState('')
+  const [hasOlder, setHasOlder] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
   const [expandedSpaces, setExpandedSpaces] = useState<Record<string, boolean>>({})
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => {
@@ -2326,6 +2344,8 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
   const [sessionPath, setSessionPath] = useState('')
   const [sessionName, setSessionName] = useState('')
   const [connectionStatus, setConnectionStatus] = useState('')
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null)
+  const [diagnosticsStatus, setDiagnosticsStatus] = useState('')
   const [runtimeState, setRuntimeState] = useState('')
   const [tree, setTree] = useState<SessionTreeNode[]>([])
   const [bashCommand, setBashCommand] = useState('')
@@ -2358,8 +2378,11 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
     void client.getSessionStats().then((value) => {
       if (mounted) setSessionStats(value)
     }).catch(() => {})
-    void client.getTranscript().then((items) => {
-      if (mounted && items.length) setMessages((current) => current.length ? current : items)
+    void client.getTranscriptPage('', TRANSCRIPT_PAGE).then((page) => {
+      if (!mounted) return
+      setOlderCursor(page.earliestId)
+      setHasOlder(page.hasMore)
+      if (page.messages.length) setMessages((current) => (current.length ? current : page.messages))
     }).catch(() => {})
     void Promise.all([client.getState(), client.getProviders(), client.getModels(), client.getThinkingLevels()]).then(([state, providerList, modelList, levels]) => {
       if (!mounted) return
@@ -2394,7 +2417,7 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
   const appendRuntimeError = (message: string) => {
     const id = nextId.current + 1
     nextId.current = id
-    setMessages((current) => [...current, { id: `m${id}`, role: 'assistant', content: `Escape engine error: ${message}` }])
+    setMessages((current) => [...current, { id: `m${id}`, role: 'assistant', content: `Engine error: ${message}` }])
   }
 
   const resolveApproval = (approved: boolean) => {
@@ -2441,8 +2464,44 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
     void client.getTree().then(setTree).catch((error: unknown) => appendRuntimeError(error instanceof Error ? error.message : String(error)))
   }
 
+  const captureDiagnostics = () => {
+    void client
+      .getDiagnostics()
+      .then((value) => setDiagnostics(value))
+      .catch((error: unknown) => appendRuntimeError(error instanceof Error ? error.message : String(error)))
+  }
+
+  const saveDiagnostics = () => {
+    void client
+      .writeDiagnostics()
+      .then((value) => {
+        if (!value) {
+          setDiagnosticsStatus('The engine wrote no report')
+          return
+        }
+        setDiagnosticsStatus(`Saved to ${value.path}`)
+      })
+      .catch((error: unknown) => setDiagnosticsStatus(error instanceof Error ? error.message : String(error)))
+  }
+
   const pingEngine = () => {
     void client.ping().then((ok) => setConnectionStatus(ok ? 'Engine connected' : 'Engine did not respond')).catch((error: unknown) => setConnectionStatus(error instanceof Error ? error.message : String(error)))
+  }
+
+  const loadOlderMessages = () => {
+    if (!hasOlder || loadingOlder || !olderCursor) return
+    setLoadingOlder(true)
+    void client
+      .getTranscriptPage(olderCursor, TRANSCRIPT_PAGE)
+      .then((page) => {
+        // Older entries belong above what is on screen, so they are prepended
+        // rather than appended, and the cursor moves further back.
+        setMessages((current) => [...page.messages, ...current])
+        setOlderCursor(page.earliestId)
+        setHasOlder(page.hasMore)
+      })
+      .catch((error: unknown) => appendRuntimeError(error instanceof Error ? error.message : String(error)))
+      .finally(() => setLoadingOlder(false))
   }
 
   const switchSessionByPath = () => {
@@ -2451,7 +2510,10 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
       if (!session) return
       setActiveSession(session)
       setSessionName(session.name)
-      setMessages(await client.getTranscript())
+      const page = await client.getTranscriptPage('', TRANSCRIPT_PAGE)
+      setMessages(page.messages)
+      setOlderCursor(page.earliestId)
+      setHasOlder(page.hasMore)
     }).catch((error: unknown) => appendRuntimeError(error instanceof Error ? error.message : String(error)))
   }
 
@@ -2693,7 +2755,7 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
       const message = error instanceof Error ? error.message : String(error)
       setMessages((current) =>
         current.map((item) =>
-          item.id === assistantKey ? { ...item, content: `Escape engine error: ${message}` } : item,
+          item.id === assistantKey ? { ...item, content: `Engine error: ${message}` } : item,
         ),
       )
       setBusy(false)
@@ -2963,11 +3025,11 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
 
   const { activeSpaceName, activeSpacePath } = useMemo(() => {
     const path = viewingSessionPath ?? activeSession?.path
-    if (!path) return { activeSpaceName: 'Escape', activeSpacePath: '' }
+    if (!path) return { activeSpaceName: '', activeSpacePath: '' }
     const session = sessions.find((item) => item.path === path)
     return session
       ? { activeSpaceName: basenameOf(session.cwd), activeSpacePath: session.cwd }
-      : { activeSpaceName: 'Escape', activeSpacePath: '' }
+      : { activeSpaceName: '', activeSpacePath: '' }
   }, [viewingSessionPath, activeSession, sessions])
 
   const agents = useMemo<RunningAgent[]>(
@@ -3071,9 +3133,15 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
           />
           <div style={{ flexGrow: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 }}>
             <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6, minWidth: 0 }}>
-              <ProjectMark path={activeSpacePath} name={activeSpaceName} size={14} />
-              <text style={{ fontSize: 11, fontFamily: FONT, color: C.tertiary }}>{activeSpaceName}</text>
-              <text style={{ fontSize: 11, fontFamily: FONT, color: C.ghost }}>/</text>
+              {/* No session means no project to name, so the breadcrumb is
+                  just the conversation. It used to fall back to the product
+                  name here, which read as a project that did not exist. */}
+              {activeSpaceName ? (
+                <>
+                  <text style={{ fontSize: 11, fontFamily: FONT, color: C.tertiary }}>{activeSpaceName}</text>
+                  <text style={{ fontSize: 11, fontFamily: FONT, color: C.ghost }}>/</text>
+                </>
+              ) : null}
               <text
                 testId="header-title"
                 style={{ fontSize: 14, fontWeight: 600, fontFamily: FONT, color: C.text, whiteSpace: 'nowrap' }}
@@ -3081,17 +3149,16 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
                 {currentTitle}
               </text>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 5 }}>
-              <div
-                style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.success }}
-              />
-              <text style={{ fontSize: 10, fontFamily: FONT, color: C.tertiary }}>
-                {busy ? 'Working' : 'Ready to help'}
-              </text>
-              {queueStatus ? <text testId="queue-status" style={{ marginTop: 2, fontSize: 9, fontFamily: FONT, color: C.tertiary }}>{queueStatus}</text> : null}
-              {compactionStatus ? <text testId="compaction-status" style={{ marginTop: 2, fontSize: 9, fontFamily: FONT, color: C.accent }}>{compactionStatus}</text> : null}
-              {turnStatus ? <text testId="turn-status" style={{ marginTop: 2, fontSize: 9, fontFamily: FONT, color: C.tertiary }}>{turnStatus}</text> : null}
-            </div>
+            {/* The header's second line only exists while something is worth
+                saying. A standing "Ready to help" with a green dot next to it
+                was the last piece of chrome that carried no information. */}
+            {queueStatus || compactionStatus || turnStatus ? (
+              <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                {queueStatus ? <text testId="queue-status" style={{ fontSize: 10, fontFamily: FONT, color: C.tertiary }}>{queueStatus}</text> : null}
+                {compactionStatus ? <text testId="compaction-status" style={{ fontSize: 10, fontFamily: FONT, color: C.accent }}>{compactionStatus}</text> : null}
+                {turnStatus ? <text testId="turn-status" style={{ fontSize: 10, fontFamily: FONT, color: C.tertiary }}>{turnStatus}</text> : null}
+              </div>
+            ) : null}
           </div>
           <div style={{ flexGrow: 1 }} />
         </div>
@@ -3136,6 +3203,10 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
               connectionStatus={connectionStatus}
               runtimeState={runtimeState}
               onPing={pingEngine}
+              diagnostics={diagnostics}
+              diagnosticsStatus={diagnosticsStatus}
+              onCaptureDiagnostics={captureDiagnostics}
+              onSaveDiagnostics={saveDiagnostics}
               loginProvider={loginProvider}
               loginKey={loginKey}
               loginStatus={loginStatus}
@@ -3209,6 +3280,28 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
           {!settingsOpen && (messages.length === 0 ? (
             <Welcome />
           ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
+            <div
+              testId="load-older"
+              role="button"
+              aria-label="Load earlier messages"
+              tabIndex={0}
+              onClick={loadOlderMessages}
+              onKeyDown={(event) => runButtonKey(event, loadOlderMessages)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                paddingTop: 6,
+                paddingBottom: 10,
+                cursor: hasOlder && !loadingOlder ? 'pointer' : 'default',
+                opacity: hasOlder ? 1 : 0,
+              }}
+            >
+              <text style={{ fontSize: 11, fontFamily: FONT, color: C.tertiary }}>
+                {loadingOlder ? 'Loading earlier messages\u2026' : 'Load earlier messages'}
+              </text>
+            </div>
             <virtual-list
               testId="message-list"
               role="log"
@@ -3230,6 +3323,7 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
                 <MessageRow key={message.id} message={message} />
               ))}
             </virtual-list>
+            </div>
           ))}
           {!settingsOpen ? <ToolActivityPanel activities={toolActivities} /> : null}
           {!settingsOpen && pendingInteraction ? (

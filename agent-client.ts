@@ -46,7 +46,10 @@ export interface AgentClient {
   getProviders(): Promise<ProviderSummary[]>
   getCommands(): Promise<CommandSummary[]>
   getSessionStats(): Promise<SessionStats | null>
+  getDiagnostics(): Promise<Diagnostics | null>
+  writeDiagnostics(outputPath?: string): Promise<{ path: string; report: string } | null>
   getTranscript(sessionPath?: string): Promise<TranscriptMessage[]>
+  getTranscriptPage(beforeId: string, limit: number, sessionPath?: string): Promise<{ messages: TranscriptMessage[]; hasMore: boolean; earliestId: string }>
   getLastAssistantText(): Promise<string>
   getForkMessages(): Promise<ForkMessage[]>
   getTree(): Promise<SessionTreeNode[]>
@@ -164,6 +167,45 @@ export type SessionStats = {
   contextWindow: number
   contextPercent: number | null
 }
+
+// TurnTiming is what one model round trip cost, split by phase. Read and build
+// grow with the session; firstToken is the network and the model. Separating
+// them is the only way to tell which one to go and fix.
+export type TurnTiming = {
+  at?: string
+  iterations?: number
+  historyReadMs?: number
+  buildMs?: number
+  firstTokenMs?: number
+  totalMs?: number
+  compacted?: boolean
+  error?: string
+}
+
+export type Diagnostics = {
+  version?: string
+  provider?: string
+  model?: string
+  thinkingLevel?: string
+  sessionId?: string
+  sessionPath?: string
+  sessionSizeBytes?: number
+  sessionEntries?: number
+  uptimeMs?: number
+  skills?: number
+  tools?: number
+  contextWindow?: number
+  lastError?: string
+  firstTokenP50Ms?: number
+  firstTokenP95Ms?: number
+  turns?: TurnTiming[]
+  /** Only present on writeDiagnostics: the rendered report. */
+  report?: string
+  path?: string
+}
+
+/** How much of a transcript to load before someone scrolls back for more. */
+export const TRANSCRIPT_PAGE = 200
 
 export type AgentState = {
   state: string
@@ -382,7 +424,10 @@ export function createLocalAgentClient(reply: (prompt: string) => string): Agent
     async getProviders() { return [{ id: 'local', name: 'Local preview', configured: true }] },
     async getCommands() { return [] },
     async getSessionStats() { return null },
+    async getDiagnostics() { return null },
+    async writeDiagnostics() { return null },
     async getTranscript() { return [] },
+    async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
     async getLastAssistantText() { return '' },
     async getForkMessages() { return [] },
     async getTree() { return [] },
@@ -599,6 +644,18 @@ export class EscapeAgentClient implements AgentClient {
     }
   }
 
+  async getDiagnostics(): Promise<Diagnostics | null> {
+    const data = await this.request({ type: 'get_diagnostics' })
+    return (data ?? null) as Diagnostics | null
+  }
+
+  // The engine writes the file, not the renderer: it already owns session
+  // export, and a diagnostics report is the same kind of artefact.
+  async writeDiagnostics(outputPath = ''): Promise<{ path: string; report: string } | null> {
+    const data = await this.request({ type: 'write_diagnostics', outputPath })
+    return (data ?? null) as { path: string; report: string } | null
+  }
+
   async ping(): Promise<boolean> {
     const data = await this.request({ type: 'ping' })
     return isRecord(data) && data.pong === true
@@ -653,26 +710,48 @@ export class EscapeAgentClient implements AgentClient {
   }
 
   async getTranscript(sessionPath?: string): Promise<TranscriptMessage[]> {
-    const data = await this.request({ type: 'get_entries', since: '', sessionPath })
-    if (!isRecord(data) || !Array.isArray(data.entries)) return []
-    return data.entries.flatMap((value) => {
+    return (await this.getTranscriptPage('', TRANSCRIPT_PAGE, sessionPath)).messages
+  }
+
+  /**
+   * A page of the transcript, oldest-first, with the cursor for reading further
+   * back. Opening a long session used to read and render every entry; now it
+   * reads a page and scrolls for the rest.
+   */
+  async getTranscriptPage(
+    beforeId: string,
+    limit: number,
+    sessionPath?: string,
+  ): Promise<{ messages: TranscriptMessage[]; hasMore: boolean; earliestId: string }> {
+    const data = await this.request({ type: 'get_page', since: beforeId, limit, sessionPath })
+    if (!isRecord(data) || !Array.isArray(data.entries)) {
+      return { messages: [], hasMore: false, earliestId: '' }
+    }
+    const messages = data.entries.flatMap((value) => {
       if (!isRecord(value) || !isRecord(value.message)) return []
       const role = readString(value.message, 'role')
+      if (role !== 'toolResult' && role !== 'user' && role !== 'assistant') return []
       const blocks = Array.isArray(value.message.content) ? value.message.content : []
-      const text = blocks.flatMap((block) => isRecord(block) && readString(block, 'type') === 'text' ? [readString(block, 'text') ?? ''] : []).join('')
+      const text = blocks
+        .flatMap((block) => (isRecord(block) && readString(block, 'type') === 'text' ? [readString(block, 'text') ?? ''] : []))
+        .join('')
       const toolCalls = blocks.flatMap((block) => {
         if (!isRecord(block) || readString(block, 'type') !== 'toolCall') return []
         const name = readString(block, 'name') ?? readString(block, 'id') ?? 'tool'
-        return [`[tool] ${name}…`]
+        return [`[tool] ${name}\u2026`]
       })
-      if (role !== 'toolResult' && role !== 'user' && role !== 'assistant') return []
       const content = role === 'toolResult'
         ? `[tool] ${readString(value.message, 'toolName') ?? 'result'}\n${text}`
         : [text, ...toolCalls].filter(Boolean).join('\n')
       if (!content) return []
       const id = readString(value, 'id') ?? `${role}-${content.length}`
-      return [{ id, role: role === 'toolResult' ? 'assistant' : role, content }]
+      return [{ id, role: role === 'toolResult' ? 'assistant' : role, content } as TranscriptMessage]
     })
+    return {
+      messages,
+      hasMore: data.hasMore === true,
+      earliestId: readString(data, 'earliestId') ?? '',
+    }
   }
 
   async getLastAssistantText(): Promise<string> {

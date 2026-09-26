@@ -68,6 +68,7 @@ const testRuntimeSettings = {
   async getCommands() { return [] },
   async getSessionStats() { return null },
   async getTranscript() { return [] },
+  async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
   async getLastAssistantText() { return '' },
   async getForkMessages() { return [] },
   async getTree() { return [] },
@@ -100,6 +101,10 @@ const testRuntimeSettings = {
   async setSteeringMode() {},
   async setFollowUpMode() {},
   async setThinkingLevel() {},
+  async getDiagnostics() {
+    return { provider: 'provider-a', model: 'model-a', firstTokenP50Ms: 120, turns: [] }
+  },
+  async writeDiagnostics() { return { path: '/tmp/diag.txt', report: 'escape diagnostics' } },
 }
 
 
@@ -116,6 +121,10 @@ function makeSettingsClient(overrides: Partial<AgentClient> = {}): AgentClient {
       }
     },
     async ping() { return true },
+    async getDiagnostics() {
+      return { provider: 'provider-a', model: 'model-a', firstTokenP50Ms: 120, turns: [] }
+    },
+    async writeDiagnostics() { return { path: '/tmp/diag.txt', report: 'escape diagnostics' } },
     async listSkills() { return { skills: [], projects: [] } },
     async setSkillEnabled() { return { pending: false } },
     async getMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
@@ -137,6 +146,7 @@ function makeSettingsClient(overrides: Partial<AgentClient> = {}): AgentClient {
       }
     },
     async getTranscript() { return [] },
+    async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
     async getLastAssistantText() { return 'last response' },
     async getForkMessages() { return [{ entryId: 'u1', text: 'question' }] },
     async getTree() { return [{ entryId: 'u1', role: 'user', text: 'question', children: [] }] },
@@ -186,8 +196,13 @@ describeNative('chat app', () => {
 
     const text = paintedText(renderer)
     expect(text).toContain('What can I help you with?')
-    expect(text).toContain('Ask Escape anything...')
+    expect(text).toContain('Ask anything...')
     expect(text).toContain('Start a chat to create your first space.')
+    // The product is named once, in the sidebar. Anywhere else it is either a
+    // fallback inventing a project name or the brand inside a sentence that
+    // reads fine without it.
+    const brandCount = (text.match(/Escape/g) ?? []).length
+    expect(brandCount).toBeLessThanOrEqual(1)
     // The suggestion chips were removed; the headline and composer are the
     // whole empty state now.
     expect(text).not.toContain('Plan a project')
@@ -242,6 +257,16 @@ describeNative('chat app', () => {
       async switchSession(path) { switched.push(path); return session },
       async getTranscript() {
         return [{ id: 'm1', role: 'user' as const, content: 'earlier question' }, { id: 'm2', role: 'assistant' as const, content: 'earlier answer' }]
+      },
+      async getTranscriptPage() {
+        return {
+          messages: [
+            { id: 'm1', role: 'user' as const, content: 'earlier question' },
+            { id: 'm2', role: 'assistant' as const, content: 'earlier answer' },
+          ],
+          hasMore: false,
+          earliestId: 'm1',
+        }
       },
       async setSessionName() {},
       stop() {},
@@ -1062,6 +1087,7 @@ describeNative('chat app', () => {
       },
       async switchSession() { return null },
       async getTranscript() { return [] },
+      async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
       async setSessionName() {},
       async answerApproval() {},
       async answerQuestion() {},
@@ -1113,6 +1139,7 @@ describeNative('chat app', () => {
       async listSessions() { return sessions },
       async send() {},
       async getTranscript() { return [] },
+      async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
       async newSession() { return null },
       async switchSession() { return null },
       async setSessionName() {},
@@ -1196,6 +1223,7 @@ describeNative('chat app', () => {
       },
       async send() {},
       async getTranscript() { return [] },
+      async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
       async newSession() { return null },
       async switchSession() { return null },
       async setSessionName() {},
@@ -1434,6 +1462,66 @@ describeNative('chat app', () => {
     await app.close()
   })
 
+  it('loads earlier transcript pages on demand rather than all at once', async () => {
+    const asked: Array<{ beforeId: string; limit: number }> = []
+    const pageFor = (beforeId: string) => {
+      asked.push({ beforeId, limit: 200 })
+      if (beforeId === '') {
+        return {
+          messages: [
+            { id: 'n2', role: 'user' as const, content: 'newest question' },
+            { id: 'n3', role: 'assistant' as const, content: 'newest answer' },
+          ],
+          hasMore: true,
+          earliestId: 'n2',
+        }
+      }
+      return {
+        messages: [{ id: 'o1', role: 'user' as const, content: 'much older question' }],
+        hasMore: false,
+        earliestId: 'o1',
+      }
+    }
+    const client: AgentClient = {
+      async listSkills() { return { skills: [], projects: [] } },
+      async setSkillEnabled() { return { pending: false } },
+      mode: 'engine',
+      ...testRuntimeSettings,
+      async getTranscriptPage(beforeId: string) { return pageFor(beforeId) },
+      async listSessions() { return [] },
+      async send() {},
+      async answerApproval() {},
+      async answerQuestion() {},
+      async newSession() { return null },
+      async switchSession() { return null },
+      async setSessionName() {},
+      stop() {},
+      close() {},
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={client} />)
+    const app = await connectTest(renderer)
+
+    // The newest page renders without asking for anything older.
+    await app.getByTestId('message-n3').waitFor({ timeoutMs: 2_000 })
+    expect(asked).toEqual([{ beforeId: '', limit: 200 }])
+
+    // Older entries are fetched only when asked for, and are prepended.
+    await app.getByTestId('load-older').click()
+    await app.getByTestId('message-o1').waitFor({ timeoutMs: 2_000 })
+    expect(asked[1]).toEqual({ beforeId: 'n2', limit: 200 })
+    const text = paintedText(renderer)
+    // The older message is above the newer ones, not appended after them.
+    expect(text.indexOf('much older question')).toBeLessThan(text.indexOf('newest question'))
+
+    // With nothing more behind it, the control stops asking.
+    const before = asked.length
+    await app.getByTestId('load-older').click()
+    await new Promise((r) => setTimeout(r, 120))
+    expect(asked.length).toBe(before)
+    await app.close()
+  })
+
   it('restores visible transcript history from the engine', async () => {
     const client: AgentClient = {
       async listSkills() { return { skills: [], projects: [] } },
@@ -1441,6 +1529,15 @@ describeNative('chat app', () => {
       mode: 'engine',
       ...testRuntimeSettings,
       async getTranscript() { return [{ id: 'u1', role: 'user', content: 'Earlier question' }, { id: 'a1', role: 'assistant', content: 'Earlier answer' }] },
+      // The app asks for a page rather than the whole transcript; see
+      // getTranscriptPage. Tests that care about the transcript supply a page.
+      async getTranscriptPage() {
+        return {
+          messages: [{ id: 'u1', role: 'user' as const, content: 'Earlier question' }, { id: 'a1', role: 'assistant' as const, content: 'Earlier answer' }],
+          hasMore: false,
+          earliestId: 'u1',
+        }
+      },
       async listSessions() { return [] },
       async send() {},
       async answerApproval() {},
