@@ -1,6 +1,10 @@
 # Escape shell
 
-Escape's GPUIX UI. The shell owns the desktop experience, while `../engine` owns the AI agent core. The two communicate through the engine's stdio RPC process.
+Escape's GPUIX UI. The shell owns the desktop experience, while the engine owns the AI agent core. The two communicate through the engine's stdio RPC process.
+
+The engine is a separate repository and a separate product surface. `escape` is a
+complete CLI in its own right and works with no GUI present, installed, or
+running. This shell is one frontend for it, not its host.
 
 The shell has two client modes:
 
@@ -8,6 +12,20 @@ The shell has two client modes:
 - Browser builds and tests use a deterministic local client, so the UI remains runnable without a Go binary or provider credentials.
 
 Provider secrets stay in the Go process. The shell never handles them.
+
+## Getting the engine
+
+The build expects the engine as a sibling checkout, because `build:engine`
+compiles `../engine` and places the binary where `bundle` looks for it.
+
+```bash
+git clone https://github.com/ekassinghchhabra/escape-engine.git engine
+git clone https://github.com/ekassinghchhabra/escape-shell.git shell
+```
+
+The two directories must be siblings. `bun run build` will fail with
+`cd: ../engine: No such file or directory` if the engine is missing, and
+`bun run test`, `bun run typecheck`, and `bun run dev` all work without it.
 
 ## Run it
 
