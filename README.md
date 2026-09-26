@@ -19,8 +19,8 @@ The build expects the engine as a sibling checkout, because `build:engine`
 compiles `../engine` and places the binary where `bundle` looks for it.
 
 ```bash
-git clone https://github.com/ekassinghchhabra/escape-engine.git engine
-git clone https://github.com/ekassinghchhabra/escape-shell.git shell
+git clone https://github.com/ekasc/escape-engine.git engine
+git clone https://github.com/ekasc/escape-shell.git shell
 ```
 
 The two directories must be siblings. `bun run build` will fail with
