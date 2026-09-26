@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+web-dist/
+tmp/
+screenshots/
+
+# pi's own state for this directory (not part of the repo)
+.pi/

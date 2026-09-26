@@ -1,0 +1,35 @@
+{
+  "name": "escape-shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot app.tsx",
+    "build": "bun run build:engine && bun run build:shell",
+    "build:engine": "mkdir -p build/engine && cd ../engine && go build -trimpath -o ../shell/build/engine/escape .",
+    "build:shell": "mkdir -p build/app && bun build app.tsx --target=bun --minify --external '@gpuix/native' --external '@gpuix/native-*' --outfile build/app/shell.js",
+    "bundle": "bun run build && bun scripts/assemble.ts",
+    "app": "bun run build && bun scripts/assemble.ts --app",
+    "run": "bun run bundle && ESCAPE_BIN=$PWD/build/release/escape ./build/release/escape-shell",
+    "install:app": "bash scripts/install.sh",
+    "verify": "bun run bundle && ESCAPE_BIN=$PWD/build/release/escape bun test ./agent-client.integration.ts",
+    "web:dev": "bun web.ts",
+    "screenshot": "bun screenshot.ts",
+    "test": "vitest run",
+    "test:integration": "bun test ./agent-client.integration.ts",
+    "typecheck": "tsc --noEmit",
+    "fixtures": "bun scripts/fixtures.ts",
+    "fixtures:fix": "bun scripts/fixtures.ts --write",
+    "clean": "rm -rf build"
+  },
+  "dependencies": {
+    "@gpuix/react": "^0.10.0",
+    "react": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/react": "^19.3.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  }
+}
