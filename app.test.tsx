@@ -2348,75 +2348,69 @@ describeNative('composer design mode', () => {
 })
 
 describeNative('add project dialog', () => {
-  it('fuzzy-matches a query against the tree, the way qq3 does', async () => {
-    // qq3 pipes find into fzf: the field filters a list, it does not complete
-    // a path. The assertion that matters is the search being a fuzzy query
-    // rather than a prefix of the directory being completed.
-    const fake = new FakeEngine()
-    fake.searchResult = {
-      directories: [
-        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
-        { name: 'escapy', path: '/Users/tester/Projects/escapy', dir: true, hasChildren: true },
-        { name: 'notes.txt', path: '/Users/tester/Projects/notes.txt', dir: false, hasChildren: false },
-      ],
-      root: '/Users/tester/Projects',
-    }
-    const { render, renderer } = createTestRoot()
+  const open = async (fake: FakeEngine) => {
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
     render(<ChatApp client={fake} />)
     await settle(renderer)
-
     const app = await connectTest(renderer)
-    try {
-      await app.getByTestId('add-project').click()
-      await settle(renderer)
-      const input = renderer.findByTestId('project-path-input')!
-      renderer.nativeSimulateKeystrokes(input.id, 'esc'.split('').join(' '))
-      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
-        await new Promise((r) => setTimeout(r, 10))
-      }
-      await settle(renderer)
+    await app.getByTestId('add-project').click()
+    await settle(renderer)
+    return { renderer, app }
+  }
 
-      const asked = fake.calls.filter((c) => c.method === 'searchDirs')
-      // The query is the field's text. qq3 hands fzf the query, not a path
-      // prefix, so "esc" is what goes over the wire.
-      expect(asked.some((c) => c.args[0] === 'esc')).toBe(true)
-      const painted = renderer.getPaintedText().join(' ')
-      expect(painted).toContain('escape')
-      expect(painted).toContain('escapy')
-      // A file is not a project, so it must not be offered as one.
-      expect(painted).not.toContain('notes.txt')
-      // And the dialog says what it searched, once, rather than repeating the
-      // absolute path on every row.
-      expect(painted).toContain('in /Users/tester/Projects')
-      expect(painted).not.toContain('Projects/escape')
+  it('opens on a field showing where a relative path starts', async () => {
+    // The whole point of the field: "Projects/escape" is a path from the start
+    // directory, so the dialog says what it is relative to rather than leaving
+    // the reader to work it out.
+    const fake = new FakeEngine()
+    const { renderer, app } = await open(fake)
+    try {
+      const field = renderer.findByTestId('project-path-input')!
+      expect(String(field?.customProps?.value)).toBe('~/')
+      expect(renderer.findByTestId('project-path-hint')).toBeDefined()
     } finally {
       await app.close()
     }
   })
 
-  it('opens with the list already showing, because an empty filter is not empty', async () => {
-    // fzf shows everything when nothing has been typed. A field that opens blank
-    // and shows nothing reads as broken, and it is the state the user sees first.
+  it('sends what was typed, rather than a path it picked', async () => {
+    // Resolution is the engine's: expanding a tilde and resolving a relative
+    // path are filesystem facts, and doing them here too would be two
+    // implementations that drift.
     const fake = new FakeEngine()
-    fake.searchResult = {
-      directories: [
-        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
-      ],
-      root: '/Users/tester/Projects',
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
+    const { renderer, app } = await open(fake)
     try {
-      await app.getByTestId('add-project').click()
-      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
-        await new Promise((r) => setTimeout(r, 10))
-      }
+      const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeystrokes(field.id, 'Projects/escape'.split('').join(' '))
       await settle(renderer)
-      expect(fake.calls.some((c) => c.method === 'searchDirs')).toBe(true)
-      expect(renderer.getPaintedText().join(' ')).toContain('escape')
+      renderer.nativeSimulateKeyDown(field.id, 'enter')
+      await settle(renderer)
+      expect(fake.calls.find((c) => c.method === 'addProject')?.args?.[0]).toBe(
+        '~/Projects/escape',
+      )
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('switches to the path the engine resolved, not the text that was typed', async () => {
+    // The engine answers with an absolute path. Switching to the raw text would
+    // move to a directory that does not exist, and would look like it worked.
+    const fake = new FakeEngine()
+    fake.addProjectResult = {
+      project: { path: '/Users/tester/Projects/escape' },
+      added: true,
+    }
+    const { renderer, app } = await open(fake)
+    try {
+      const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeystrokes(field.id, 'Projects/escape'.split('').join(' '))
+      await settle(renderer)
+      renderer.nativeSimulateKeyDown(field.id, 'enter')
+      await settle(renderer)
+      expect(
+        fake.calls.find((c) => c.method === 'switchProject')?.args?.[0],
+      ).toBe('/Users/tester/Projects/escape')
     } finally {
       await app.close()
     }
@@ -2426,24 +2420,14 @@ describeNative('add project dialog', () => {
     // The engine reports added=false for a duplicate. Reporting "Added" would
     // be a lie the user cannot check.
     const fake = new FakeEngine()
-    fake.searchResult = {
-      directories: [
-        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
-      ],
-      root: '/Users/tester/Projects',
-    }
     fake.addProjectResult = { project: { path: '/Users/tester/Projects/escape' }, added: false }
-    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
+    const { renderer, app } = await open(fake)
     try {
-      await openAddProject(renderer, app, fake)
       const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeystrokes(field.id, 'Projects/escape'.split('').join(' '))
+      await settle(renderer)
       renderer.nativeSimulateKeyDown(field.id, 'enter')
       await settle(renderer)
-
       const painted = renderer.getPaintedText().join(' ')
       expect(painted).toContain('is already a project')
       expect(painted).not.toContain('Added escape')
@@ -2454,174 +2438,23 @@ describeNative('add project dialog', () => {
 
   it('shows the engine message when the path is not a directory', async () => {
     const fake = new FakeEngine()
-    fake.searchResult = { directories: [], root: '/Users/tester/Projects' }
-    fake.failures.addProject = 'stat /nope: no such file or directory'
-    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
+    fake.failures = { addProject: 'no such directory' }
+    const { renderer, app } = await open(fake)
     try {
-      await openAddProject(renderer, app, fake)
-      // Nothing matches "/nope", so there is no row to take. Enter on an empty
-      // list has to fall back to the typed path, or a mistyped path could never
-      // be submitted at all.
       const field = renderer.findByTestId('project-path-input')!
-      renderer.nativeSimulateKeystrokes(field.id, '/nope'.split('').join(' '))
+      renderer.nativeSimulateKeystrokes(field.id, 'nope'.split('').join(' '))
       await settle(renderer)
       renderer.nativeSimulateKeyDown(field.id, 'enter')
       await settle(renderer)
-
-      // The engine distinguishes a missing path from a file, and that
-      // distinction is the whole reason the user can fix their own typo.
-      expect(renderer.getPaintedText().join(' ')).toContain('no such file or directory')
-    } finally {
-      await app.close()
-    }
-  })
-
-  it('adds a project when a result is chosen, in one action', async () => {
-    // qq3 cds on Enter. Making the user pick a result and then press Add is the
-    // extra step the alias does not have.
-    const fake = new FakeEngine()
-    fake.searchResult = {
-      directories: [
-        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
-      ],
-      root: '/Users/tester/Projects',
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
-    try {
-      await app.getByTestId('add-project').click()
-      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
-        await new Promise((r) => setTimeout(r, 10))
-      }
-      await settle(renderer)
-      await app.getByTestId('project-suggestion-/Users/tester/Projects/escape').click()
-      await settle(renderer)
-
-      const add = fake.calls.find((c) => c.method === 'addProject')
-      expect(add).toBeDefined()
-      expect(add!.args[0]).toBe('/Users/tester/Projects/escape')
+      expect(renderer.getPaintedText().join(' ')).toContain('no such directory')
     } finally {
       await app.close()
     }
   })
 })
 
-describe('fuzzy match highlighting', () => {
-  it('splits a label into the runs the matcher used', () => {
-    // The engine indexes into the path relative to the root, which is the text
-    // the row shows. "aoi" in "ts/aoi" is at 3,4,5.
-    expect(highlightRuns('ts/aoi', [3, 4, 5])).toEqual([
-      { text: 'ts/', matched: false },
-      { text: 'aoi', matched: true },
-    ])
-  })
 
-  it('handles a match that spans a separator', () => {
-    expect(highlightRuns('ts/aoi-website', [0, 1, 3, 4, 5])).toEqual([
-      { text: 'ts', matched: true },
-      { text: '/', matched: false },
-      { text: 'aoi', matched: true },
-      { text: '-website', matched: false },
-    ])
-  })
 
-  it('shows the whole label when nothing was typed', () => {
-    expect(highlightRuns('ts/aoi', undefined)).toEqual([{ text: 'ts/aoi', matched: false }])
-    expect(highlightRuns('ts/aoi', [])).toEqual([{ text: 'ts/aoi', matched: false }])
-  })
-
-  it('ignores indices that fall outside the label', () => {
-    // A stale or hand-edited index must not throw or produce an empty row. The
-    // in-range ones still apply, so the row is not left unmarked.
-    expect(highlightRuns('ts', [0, 9, -1])).toEqual([
-      { text: 't', matched: true },
-      { text: 's', matched: false },
-    ])
-    expect(highlightRuns('ts', [9, -1])).toEqual([{ text: 'ts', matched: false }])
-  })
-})
-
-describeNative('add project keyboard', () => {
-  it('moves the active row with the arrow keys and adds it on Enter', async () => {
-    // If GPUIX does not deliver keys to an input, this fails and the answer is
-    // that the list needs its own key handling rather than a silent no-op.
-    const fake = new FakeEngine()
-    fake.searchResult = {
-      directories: [
-        { name: 'aoi', path: '/Users/tester/Projects/ts/aoi', dir: true, hasChildren: true, match: [3, 4, 5] },
-        { name: 'go-aoi', path: '/Users/tester/Projects/go/aoi-go', dir: true, hasChildren: true, match: [3, 4, 5] },
-        { name: 'aoi-site', path: '/Users/tester/Projects/ts/aoi-site', dir: true, hasChildren: true, match: [3, 4, 5] },
-      ],
-      root: '/Users/tester/Projects',
-    }
-    const { render, renderer } = // The same window key entry point the real window uses. The test root builds
-    // its own window, so without this the arrows cannot be reached at all.
-    createTestRoot({ onKeyDown: dispatchWindowKey })
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
-    try {
-      await app.getByTestId('add-project').click()
-      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
-        await new Promise((r) => setTimeout(r, 10))
-      }
-      await settle(renderer)
-
-      // The labels are relative to the root, which is stated once in the footer.
-      // Checked against the array, not a joined string: the label is one path
-      // split into coloured runs, and joining with a space would invent the very
-      // gap the gap:0 above exists to prevent.
-      // Each label arrives as its runs, not as one string: "go/aoi-go" with the
-      // query matched on aoi is "go/", "aoi", "-go". Asserting the joined form
-      // would pass even if the runs were never split.
-      const painted = renderer.getPaintedText()
-      expect(painted).toContain('ts/')
-      expect(painted).toContain('aoi')
-      expect(painted).toContain('go/')
-      expect(painted).toContain('-go')
-      expect(painted).not.toContain('go/aoi-go')
-      expect(painted.join(' ')).not.toContain('/Users/tester/Projects/ts/aoi ')
-
-      // Move to the second row and add it without touching the mouse.
-      const rows = renderer.findByTestId('project-suggestion-/Users/tester/Projects/go/aoi-go')
-      expect(rows).toBeDefined()
-      // A real key down, not simulateKeystrokes: that one types the literal
-      // text "arrowdown" into the focused input, which is a harness artifact
-      // rather than a key press, and it would corrupt the query the same way.
-      const field = renderer.findByTestId('project-path-input')!
-      renderer.nativeSimulateKeyDown(field.id, 'arrowdown')
-      await settle(renderer)
-      renderer.nativeSimulateKeyDown(field.id, 'enter')
-      await settle(renderer)
-
-      // The chosen row is what got added, and the arrow did not leak into the
-      // field as text on the way.
-      expect(renderer.getPaintedText().join(' ')).not.toContain('arrowdown')
-      // A successful add says nothing. It lands you in the project and the
-      // sidebar chip reports cwd, so the chip is the receipt — announcing it as
-      // well put the good news in the smallest text on screen.
-      expect(renderer.getPaintedText().join(' ')).not.toContain('Added aoi-go.')
-
-      const add = fake.calls.find((c) => c.method === 'addProject')
-      expect(add).toBeDefined()
-      expect(add!.args[0]).toBe('/Users/tester/Projects/go/aoi-go')
-      // The picker is repopulated from the engine rather than patched locally,
-      // so a project that failed to add cannot appear to have worked. addProject
-      // had an implementation and no caller until this path existed.
-      expect(fake.calls.filter((c) => c.method === 'listProjects').length).toBeGreaterThan(1)
-    } finally {
-      await app.close()
-    }
-  })
-})
 
 describe('palette contrast floors', () => {
   // The reason `muted` exists. tertiary and ghost are too dark to read as text on
@@ -2701,90 +2534,6 @@ describeNative('design run screenshots', () => {
   })
 })
 
-describeNative('add project cursor', () => {
-  it('keeps the cursor on its row when the list is re-filtered', async () => {
-    // The defining behaviour of a fuzzy finder: arrow down, then type, and the
-    // selection is still the thing you were pointing at. Resetting to the top on
-    // every keystroke makes arrow-and-type unusable together, which is the one
-    // combination the keyboard is there for.
-    const fake = new FakeEngine()
-    fake.searchResult = {
-      directories: [
-        { name: 'ts-aoi', path: '/Users/tester/Projects/ts/aoi', dir: true, hasChildren: true },
-        { name: 'go-aoi', path: '/Users/tester/Projects/go/aoi-go', dir: true, hasChildren: true },
-        { name: 'lua-aoi', path: '/Users/tester/Projects/lua/aoi.lua', dir: true, hasChildren: true },
-      ],
-      root: '/Users/tester/Projects',
-    }
-    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
-    try {
-      await openAddProject(renderer, app, fake)
-
-      // Move to the second row.
-      const field = renderer.findByTestId('project-path-input')!
-      renderer.nativeSimulateKeyDown(field.id, 'arrowdown')
-      await settle(renderer)
-      renderer.nativeSimulateKeyDown(field.id, 'enter')
-      await settle(renderer)
-      // Row two was the go/ one.
-      expect(fake.calls.find((c) => c.method === 'addProject')!.args[0]).toBe(
-        '/Users/tester/Projects/go/aoi-go',
-      )
-
-      // Reopen, move down, then type. The selection must survive the re-filter.
-      fake.calls.length = 0
-      await openAddProject(renderer, app, fake)
-      const field2 = renderer.findByTestId('project-path-input')!
-      renderer.nativeSimulateKeyDown(field2.id, 'arrowdown')
-      await settle(renderer)
-      renderer.nativeSimulateKeystrokes(field2.id, 'o'.split('').join(' '))
-      await settle(renderer)
-      renderer.nativeSimulateKeyDown(field2.id, 'enter')
-      await settle(renderer)
-
-      const added = fake.calls.find((c) => c.method === 'addProject')
-      expect(added).toBeDefined()
-      // Still the go/ row, not a jump back to the first one.
-      expect(added!.args[0]).toBe('/Users/tester/Projects/go/aoi-go')
-    } finally {
-      await app.close()
-    }
-  })
-
-  it('reaches every result the engine returned', async () => {
-    // The list used to be capped at 12 while the engine returned 40, which left
-    // 28 directories reachable by no means at all. There is no cap now, and the
-    // footer reports the real number rather than the number on screen.
-    const many = Array.from({ length: 40 }, (_, i) => ({
-      name: `proj-${i}`,
-      path: `/Users/tester/Projects/proj-${i}`,
-      dir: true,
-      hasChildren: true,
-    }))
-    const fake = new FakeEngine()
-    fake.searchResult = { directories: many, root: '/Users/tester/Projects' }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-
-    const app = await connectTest(renderer)
-    try {
-      await openAddProject(renderer, app, fake)
-      const painted = renderer.getPaintedText().join(' ')
-      expect(painted).toContain('proj-39')
-      expect(painted).toContain('40 in /Users/tester/Projects')
-      // And the last one is genuinely selectable, not merely painted.
-      const last = renderer.findByTestId('project-suggestion-/Users/tester/Projects/proj-39')
-      expect(last).toBeDefined()
-    } finally {
-      await app.close()
-    }
-  })
-})
 
 describe('motion vocabulary', () => {
   it('pins the durations to the values the timings were chosen against', () => {
@@ -2880,11 +2629,19 @@ describe('no left-edge markers', () => {
     }
   })
 
-  it('marks the active row with weight, which survives without colour', () => {
-    // The rule is not "no way to tell which row is active" — it is "not with a
-    // bar". Weight is the replacement, and this is what holds the line.
+  it('marks the current project with a check, not a bar', () => {
+    // The rule is not "no way to tell which row is current" — it is "not with a
+    // bar". A check beside the name is the replacement, and this holds the line
+    // for the row that took the palette's place.
+    //
+    // Scoped to the row's own source rather than the file, because a panel edge
+    // is not a selection marker and the check above already distinguishes them.
     const { text } = sources[0]!
-    expect(text).toMatch(/fontWeight: run\.matched \? 700 : active \? 600 : 400/)
+    const start = text.indexOf('function ProjectRow(')
+    expect(start).toBeGreaterThan(-1)
+    const row = text.slice(start, text.indexOf('\n}\n', start))
+    expect(row).toContain('{current && <Icon name="check"')
+    expect(row).not.toMatch(/borderLeftWidth|borderRightWidth/)
   })
 })
 
@@ -2929,129 +2686,6 @@ describe('key names', () => {
   })
 })
 
-describeNative('picker keyboard', () => {
-  /**
-   * Two different key paths, deliberately not conflated.
-   *
-   * Arrows and home/end are dispatched as *element* events on the field, which
-   * is how the real window delivers them: GPUI gives a key to the focused
-   * element and to the window listener, and a text field's caret key action can
-   * consume an arrow before the window ever sees it.
-   *
-   * Enter is not faked that way. In the real pipeline Enter becomes the input's
-   * submit, so it goes through the harness's keystroke API instead. Sending a
-   * synthetic element keyDown for it would assert against a route the app does
-   * not take.
-   */
-  const pressOnField = async (
-    renderer: TestRenderer,
-    fieldId: number,
-    key: string,
-  ): Promise<void> => {
-    // `dispatchEvent` is private in the published type but assigned in the
-    // constructor, so it is a real capability rather than a test-only fiction.
-    // It is the only way to express this case: the public keystroke helpers
-    // deliver a fixed set of key names to the window and silently discard the
-    // rest — home, end, left and right never arrive at all.
-    const send = (renderer as unknown as { dispatchEvent: (event: unknown) => void })
-      .dispatchEvent
-    send.call(renderer, { eventType: 'keyDown', elementId: fieldId, key })
-    await settle(renderer)
-  }
-
-  const submit = async (renderer: TestRenderer, fieldId: number): Promise<void> => {
-    renderer.nativeSimulateKeyDown(fieldId, 'enter')
-    await settle(renderer)
-  }
-
-  /** Which row the cursor is on, read from the row itself rather than inferred. */
-  const selected = (renderer: TestRenderer, path: string): boolean => {
-    const row = renderer.findByTestId(`project-suggestion-${path}`)
-    expect(row).toBeDefined()
-    return row?.customProps?.['aria-selected'] === true
-  }
-
-  const openPickerWith = async (names: string[]) => {
-    const rows = names.map((n) => ({
-      name: `proj-${n}`,
-      path: `/Users/tester/Projects/proj-${n}`,
-      dir: true,
-      hasChildren: true,
-    }))
-    const fake = new FakeEngine()
-    fake.searchResult = { directories: rows, root: '/Users/tester/Projects' }
-    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
-    render(<ChatApp client={fake} />)
-    await settle(renderer)
-    const app = await connectTest(renderer)
-    await openAddProject(renderer, app, fake)
-    return { renderer, fake, app, field: renderer.findByTestId('project-path-input')! }
-  }
-
-  const added = (fake: FakeEngine): string | undefined => {
-    const call = fake.calls.find((c) => c.method === 'addProject')
-    const first: unknown = call?.args?.[0]
-    return typeof first === 'string' ? first : undefined
-  }
-
-  it('moves the cursor with the platform spelling of the keys', async () => {
-    const { renderer, fake, app, field } = await openPickerWith(['a', 'b', 'c'])
-
-    expect(selected(renderer, '/Users/tester/Projects/proj-a')).toBe(true)
-    await pressOnField(renderer, field.id, 'down')
-    expect(selected(renderer, '/Users/tester/Projects/proj-b')).toBe(true)
-    expect(selected(renderer, '/Users/tester/Projects/proj-a')).toBe(false)
-
-    await submit(renderer, field.id)
-    expect(added(fake)).toBe('/Users/tester/Projects/proj-b')
-    await app.close()
-  })
-
-  it('moves on the input, not only on the window', async () => {
-    // The regression that mattered. Handling arrows solely on the window looked
-    // correct and every test agreed, because the test renderer routes keys to
-    // the window unconditionally. The real field consumes them first.
-    const { renderer, fake, app, field } = await openPickerWith(['a', 'b', 'c', 'd'])
-
-    // Up from the first row wraps to the last.
-    await pressOnField(renderer, field.id, 'up')
-    expect(selected(renderer, '/Users/tester/Projects/proj-d')).toBe(true)
-    await submit(renderer, field.id)
-    expect(added(fake)).toBe('/Users/tester/Projects/proj-d')
-    await app.close()
-  })
-
-  it('jumps to the ends of the list with home and end', async () => {
-    const { renderer, fake, app, field } = await openPickerWith(['a', 'b', 'c', 'd', 'e'])
-
-    await pressOnField(renderer, field.id, 'end')
-    expect(selected(renderer, '/Users/tester/Projects/proj-e')).toBe(true)
-    await submit(renderer, field.id)
-    expect(added(fake)).toBe('/Users/tester/Projects/proj-e')
-    await app.close()
-  })
-
-  it('reaches a row the mouse could not, and scrolls it into view', async () => {
-    // Forty results, cursor walked to the end. It must be selectable, not merely
-    // painted, and the panel must have been told to bring it into view.
-    const { renderer, fake, app, field } = await openPickerWith(
-      Array.from({ length: 40 }, (_, i) => String(i)),
-    )
-    const scrolled: number[] = []
-    const original = renderer.scrollIntoView
-    renderer.scrollIntoView = ((id: number) => {
-      scrolled.push(id)
-      return original.call(renderer, id)
-    }) as typeof renderer.scrollIntoView
-
-    await pressOnField(renderer, field.id, 'end')
-    expect(selected(renderer, '/Users/tester/Projects/proj-39')).toBe(true)
-    expect(scrolled.length).toBeGreaterThan(0)
-    await submit(renderer, field.id)
-    expect(added(fake)).toBe('/Users/tester/Projects/proj-39')
-    await app.close()
-  })
-})
 
 describeNative('sidebar projects and recent sessions', () => {
   it('lists the projects in the sidebar, not behind a dropdown', async () => {

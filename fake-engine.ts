@@ -14,7 +14,6 @@ import type {
   ForkMessage,
   MemorySnapshot,
   ModelInfo,
-  PathCompletion,
   Project,
   ProviderSummary,
   SessionStats,
@@ -443,27 +442,6 @@ export class FakeEngine implements AgentClient {
     this.calls.push({ method: 'listProjects', args: [] })
     this.fail('listProjects')
     return { projects: this.projects.map((p) => ({ ...p })), current: this.state.cwd }
-  }
-
-  /** What completePath reports, so a test can drive the suggestions list. */
-  completions: PathCompletion[] = []
-
-  async completePath(path: string): Promise<PathCompletion[]> {
-    this.calls.push({ method: 'completePath', args: [path] })
-    this.fail('completePath')
-    return this.completions.map((c) => ({ ...c }))
-  }
-
-  /** What searchDirs reports, so a test can drive the fuzzy list. */
-  searchResult: { directories: PathCompletion[]; root: string } = { directories: [], root: '' }
-
-  async searchDirs(query: string, root?: string, depth?: number, limit?: number): Promise<{ directories: PathCompletion[]; root: string }> {
-    this.calls.push({ method: 'searchDirs', args: [query] })
-    this.fail('searchDirs')
-    return {
-      directories: this.searchResult.directories.map((d) => ({ ...d })),
-      root: this.searchResult.root,
-    }
   }
 
   /**

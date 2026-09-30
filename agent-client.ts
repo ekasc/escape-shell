@@ -107,8 +107,6 @@ export interface AgentClient {
   getCommands(): Promise<CommandSummary[]>
   getSessionStats(): Promise<SessionStats | null>
   listProjects(): Promise<{ projects: Project[]; current: string }>
-  completePath(path: string): Promise<PathCompletion[]>
-  searchDirs(query: string, root?: string, depth?: number, limit?: number): Promise<{ directories: PathCompletion[]; root: string }>
   addProject(path: string): Promise<{ project: Project; added: boolean }>
   removeProject(path: string): Promise<{ removed: boolean }>
   switchProject(path: string): Promise<{ cwd: string }>
@@ -379,20 +377,6 @@ export const TRANSCRIPT_PAGE = 200
 
 export type Project = { path: string; added?: string }
 
-export type PathCompletion = {
-  name: string
-  path: string
-  dir: boolean
-  hasChildren: boolean
-  /**
-   * Indices in the path relative to the search root that the query matched, as
-   * computed by the engine's own matcher. Present so the highlight and the
-   * ranking come from one implementation; nil when nothing was typed.
-   */
-  match?: number[]
-  /** Unix nanos the directory last changed, used to show recency. */
-  mtime?: number
-}
 
 export type AgentState = {
   state: string
@@ -721,8 +705,6 @@ export function createLocalAgentClient(reply: (prompt: string) => string): Agent
     async getCommands() { return [] },
     async getSessionStats() { return null },
     async listProjects() { return { projects: [], current: '' } },
-    async completePath() { return [] },
-    async searchDirs() { return { directories: [], root: '' } },
     async addProject() { return { project: { path: '' }, added: true } },
     async removeProject() { return { removed: true } },
     async switchProject() { return { cwd: '' } },
@@ -1021,48 +1003,7 @@ export class EscapeAgentClient implements AgentClient {
     }
   }
 
-  async completePath(path: string): Promise<PathCompletion[]> {
-    const data = await this.request({ type: 'complete_path', sessionPath: path })
-    const list = isRecord(data) && Array.isArray(data.completions) ? data.completions : []
-    return list.flatMap((value) => {
-      if (!isRecord(value)) return []
-      const full = readString(value, 'path')
-      const name = readString(value, 'name')
-      if (!full || !name) return []
-      return [{
-        name,
-        path: full,
-        dir: value.dir === true,
-        hasChildren: value.hasChildren === true,
-      }]
-    })
-  }
 
-  // searchDirs is a bounded directory walk ranked against what was typed, which
-  // is the same thing a shell function piping find into fzf does. The engine
-  // returns the root it searched so the caller can show it.
-  async searchDirs(
-    query: string,
-    root?: string,
-    depth = 3,
-    limit = 60,
-  ): Promise<{ directories: PathCompletion[]; root: string }> {
-    const data = await this.request({ type: 'search_dirs', query, sessionPath: root ?? '', depth, limit })
-    const list = isRecord(data) && Array.isArray(data.directories) ? data.directories : []
-    const directories = list.flatMap((value) => {
-      if (!isRecord(value)) return []
-      const full = readString(value, 'path')
-      const name = readString(value, 'name')
-      if (!full || !name) return []
-      return [{
-        name,
-        path: full,
-        dir: value.dir === true,
-        hasChildren: value.hasChildren === true,
-      }]
-    })
-    return { directories, root: isRecord(data) ? readString(data, 'root') ?? '' : '' }
-  }
 
   async listProjects(): Promise<{ projects: Project[]; current: string }> {
     const data = await this.request({ type: 'list_projects' })

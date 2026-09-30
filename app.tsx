@@ -15,7 +15,6 @@ import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from '
 import { C, type Palette } from './theme-tokens'
 import { normaliseKey } from './keys'
 import { DURATION, fadeIn } from './motion'
-import type { PathCompletion } from './agent-client'
 import { DesignRun, type DesignOutcome, type DesignPhase } from './design-run'
 import { createEscapeAgentClient, TRANSCRIPT_PAGE } from './agent-client'
 import { systemFonts } from './fonts'
@@ -6316,39 +6315,22 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
   // The path being typed into the add-project sheet, kept here rather than in
   // the sheet so the sheet can be reopened with the last attempt in it.
   const [projectPath, setProjectPath] = useState('')
-  const [projectSuggestions, setProjectSuggestions] = useState<PathCompletion[]>([])
-  // Which row the keyboard is on. A fuzzy finder you can only click is not one,
-  // so this is what the arrow keys move and what Enter acts on.
-  const [projectActive, setProjectActive] = useState(0)
-  // Mirrors of the two values the keyboard acts on. The input's own onSubmit
-  // closure is attached at render time, so after an arrow key moves the cursor
-  // it would still see the old index and Enter would add the wrong row. Reading
-  // through a ref is what keeps the two entry points agreeing.
-  const projectActiveRef = useRef(0)
-  // The path under the cursor, tracked separately from its index so the cursor
-  // can survive a re-query. An index alone cannot be preserved, because the row
-  // it pointed at moves every time the list is filtered.
-  const currentPathRef = useRef('')
-  const projectSuggestionsRef = useRef<PathCompletion[]>([])
-  // Where the list came from, so the dialog can say what it searched rather
-  // than leaving the reader to guess.
-  const [projectRoot, setProjectRoot] = useState('')
-  const suggestSeq = useRef(0)
-  // What the engine found, before the list was capped for display. The footer
-  // used to report the capped number, so "12 in ~/Projects" appeared when the
-  // engine had returned forty: a count that reads as the total and is not one.
-  const [projectTotal, setProjectTotal] = useState(0)
+  // What a relative path in the field is taken from, in the form a person would
+  // type. It is the start directory, which defaults to the home folder, so the
+  // field can be left showing "~/".
+  const projectRootHint = (() => {
+    const home = os.homedir()
+    const base = startDir.trim()
+    if (base === '' || base === home) return '~/'
+    if (base.startsWith(home + '/')) return '~' + base.slice(home.length)
+    return base
+  })()
   const [projectPending, setProjectPending] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [diffOpen, setDiffOpen] = useState(false)
   const [diffPatch, setDiffPatch] = useState('')
   const searchInputRef = useRef<PublicInstance | null>(null)
   const projectInputRef = useRef<PublicInstance | null>(null)
-  // The row the cursor is on. Held so it can be scrolled into view: the list is
-  // taller than the panel, so arrowing past the fold used to walk the selection
-  // off-screen and leave the keyboard user with no idea where they were.
-  const projectRowRefs = useRef<Map<string, PublicInstance>>(new Map())
-  const { renderer: projectRenderer } = useGpuix()
   const [query, setQuery] = useState('')
   const [draft, setDraft] = useState('')
   const [tailTick, setTailTick] = useState(0)
@@ -6635,132 +6617,20 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
    * reason the row has to be visible at all.
    */
   /**
-   * Moves the row cursor, and keeps it on screen.
+   * Adds the project named in the field and switches to it.
    *
-   * The list is taller than the panel, so without the scroll the cursor walks
-   * out of view and a keyboard user has no way to know it happened.
+   * The field holds what a person typed, which may be relative or start with a
+   * tilde, so the switch uses the path the engine resolved rather than the text
+   * that was typed. Switching to the raw text would move to a directory that
+   * does not exist.
    */
-  const moveProjectCursor = (key: 'up' | 'down' | 'home' | 'end') => {
-    const list = projectSuggestionsRef.current
-    if (list.length === 0) return
-    const from = projectActiveRef.current
-    const next =
-      key === 'home'
-        ? 0
-        : key === 'end'
-          ? list.length - 1
-          : // Wraps, so holding a key walks the list rather than sticking.
-            (from + (key === 'down' ? 1 : -1) + list.length) % list.length
-    projectActiveRef.current = next
-    const path = list[next]?.path ?? ''
-    currentPathRef.current = path
-    setProjectActive(next)
-    queueMicrotask(() => {
-      const row = projectRowRefs.current.get(path)
-      if (row) projectRenderer?.scrollIntoView?.(row.id)
-    })
-  }
-
-  /**
-   * Arrow keys, as delivered to the *input element*.
-   *
-   * GPUI hands a key to the focused element and to the window listener, and a
-   * key action on a text field — caret movement — can swallow it before the
-   * window ever sees it. That is why the arrows were dead: they were only ever
-   * handled on the window. GPUIX's own ComboboxInput handles them here for the
-   * same reason, which is the closest thing to an authority on the question.
-   */
-  const projectInputKeyHandler = (rawKey: string): boolean => {
-    const key = normaliseKey(rawKey)
-    if (key !== 'down' && key !== 'up' && key !== 'home' && key !== 'end') return false
-    moveProjectCursor(key)
-    return true
-  }
-
-  const projectKeyHandler = (rawKey: string): boolean => {
-    // Normalised, because GPUI sends "down" where the DOM sends "arrowdown" and
-    // the test renderer sends the DOM spelling. Comparing raw key strings is
-    // precisely how the arrow keys came to be dead in the app while every test
-    // passed: the tests were exercising the harness's names.
-    const key = normaliseKey(rawKey)
-    // No arrow handling here on purpose. GPUIX's own ComboboxInput moves a
-    // focused combobox with arrows from the input's own onKeyDown and installs
-    // no window handler for them; had GPUI delivered the same press to both,
-    // every arrow press in every GPUIX combobox would move two rows. So the
-    // field is the only owner, and a second handler here would be a second bug.
-    if (key === 'escape') {
-      setOverlay(null)
-      return true
-    }
-    if (key === 'enter') {
-      const chosen = projectSuggestionsRef.current[projectActiveRef.current]
-      if (chosen) void addProject(chosen.path)
-      else if (projectPath.trim() !== '') void addProject(projectPath)
-      return true
-    }
-    return false
-  }
-
-  // Installed while the dialog is open and removed when it closes, so the
-  // arrows do not keep steering a list nobody can see.
-  useEffect(() => {
-    if (overlay !== 'add-project') {
-      setWindowKeyHandler(null)
-      return
-    }
-    setWindowKeyHandler(projectKeyHandler)
-    return () => setWindowKeyHandler(null)
-  }, [overlay, projectSuggestions, projectActive, projectPath])
-
-  const suggestPaths = async (raw: string) => {
-    const path = raw.trim()
-    // The sequence guards staleness. An answer for text the user has since
-    // replaced is worse than no answer, because it offers directories that have
-    // nothing to do with what is in the field.
-    const seq = ++suggestSeq.current
-    setProjectPending(true)
-    try {
-      const { directories, root: searched } = await client.searchDirs(path, undefined, 2, 40)
-      if (seq !== suggestSeq.current) return
-      // No cap. The engine already bounds the walk at 40, and slicing that to 12
-      // left 28 directories reachable by no means at all — not by scrolling,
-      // not by typing, nothing. A list that silently drops results is worse than
-      // a long one, because the footer claimed a total it was not showing.
-      const shown = directories.filter((c) => c.dir)
-      // Read the selected path before the ref is overwritten with the new list.
-      const before = projectSuggestionsRef.current.length ? currentPathRef.current : ''
-      projectSuggestionsRef.current = shown
-      setProjectSuggestions(shown)
-      setProjectRoot(searched)
-      // Keep the cursor on whatever it was pointing at. Resetting to the top on
-      // every keystroke means arrowing down and then typing throws the selection
-      // away, which is the one thing a fuzzy finder must not do: the point of
-      // the cursor is to narrow a list you are already reading. If the selected
-      // path survived the new query it stays selected; otherwise the cursor
-      // falls back to the top.
-      const all = directories.filter((c) => c.dir)
-      setProjectTotal(all.length)
-      const kept = before ? shown.findIndex((c) => c.path === before) : -1
-      const next = kept >= 0 ? kept : 0
-      currentPathRef.current = kept >= 0 ? before : shown[0]?.path ?? ''
-      projectActiveRef.current = next
-      setProjectActive(next)
-    } catch {
-      if (seq === suggestSeq.current) setProjectSuggestions([])
-    } finally {
-      // Only the newest request may clear the flag, or a slow earlier one would
-      // switch the indicator off while a later search was still running.
-      if (seq === suggestSeq.current) setProjectPending(false)
-    }
-  }
-
   const addProject = async (raw: string) => {
-    const path = raw.trim()
-    if (!path) return
+    const typed = raw.trim()
+    if (!typed) return
     try {
-      const result = await client.addProject(path)
+      const result = await client.addProject(typed)
+      const path = result.project.path
       setProjectPath('')
-      currentPathRef.current = ''
       setOverlay(null)
       setProjects((await client.listProjects()).projects)
       // Adding lands you in the project, and the sidebar chip is driven by cwd,
@@ -7309,10 +7179,10 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
           onNewTask={newTask}
           onAddProject={() => {
             setSubmitNotice('')
+            // The field opens showing the start directory, so "Projects/escape"
+            // is a path from there rather than something to retype in full.
+            setProjectPath(projectRootHint)
             setOverlay('add-project')
-            // Opened with the list already loaded, the way a fuzzy finder does
-            // on open. An empty field that shows nothing reads as broken.
-            void suggestPaths('')
           }}
           onSearch={() => {
             setQuery('')
@@ -7591,234 +7461,60 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
         bare
         initialFocus={projectInputRef}
       >
-        {/* The field is fused to the top of the panel with a rule under it,
-            rather than floating in a padded box. That single change is most of
-            what stops this reading as a form dialog and starts it reading as a
-            finder. */}
+        {/* A field, not a finder. The search that used to be here walked the
+            tree and ranked directories against what was typed, which meant the
+            answer to "which directory" was a list nobody had asked for. A
+            person opening this knows the path, and the two forms they write are
+            "~/Projects/escape" and "Projects/escape"; the engine expands the
+            first and takes the second from the start directory. */}
         <div
           style={{
             display: 'flex',
-            flexDirection: 'row',
-            alignItems: 'center',
-            gap: 10,
-            height: 52,
-            flexShrink: 0,
+            flexDirection: 'column',
             paddingLeft: 16,
             paddingRight: 16,
-            // One colour prop for all sides, so a rule is a zero-width-everywhere-
-            // else border rather than a per-side colour.
-            borderBottomWidth: 1,
-            borderColor: C.border,
+            paddingTop: 4,
+            paddingBottom: 12,
           }}
         >
-          <Icon name="search" size={15} color={projectPath === '' ? C.ghost : C.accent} />
           <input
             ref={projectInputRef}
             testId="project-path-input"
             value={projectPath}
-            placeholder="Add a project…"
+            placeholder={projectRootHint}
             theme={currentTheme()}
-            onChange={(event) => {
-              const next = event.value ?? ''
-              setProjectPath(next)
-              void suggestPaths(next)
-            }}
-            // Enter and the arrows are both delivered here rather than on the
-            // window. A text field's key actions — caret movement — consume
-            // arrow keys before the window listener runs, so a window-only
-            // handler is dead on arrival while every test passes, because the
-            // test renderer routes keys to the window unconditionally.
-            onKeyDown={(event: { key?: string }) => {
-              if (event.key !== undefined) projectInputKeyHandler(event.key)
-            }}
-            onSubmit={() => {
-              const chosen = projectSuggestionsRef.current[projectActiveRef.current]
-              void addProject(chosen ? chosen.path : projectPath)
-            }}
+            onChange={(event) => setProjectPath(event.value ?? '')}
+            onSubmit={() => void addProject(projectPath)}
             style={{
-              flexGrow: 1,
-              minWidth: 0,
-              height: '100%',
-              fontSize: 15,
+              height: 34,
+              fontSize: 14,
               color: C.text,
               backgroundColor: '#00000000',
               borderWidth: 0,
             }}
           />
-          {projectPath !== '' ? (
-            <div
-              testId="project-path-clear"
-              role="button"
-              aria-label="Clear"
-              tabIndex={0}
-              onClick={() => {
-                setProjectPath('')
-                setProjectSuggestions([])
-                void suggestPaths('')
-              }}
-              onKeyDown={(event: { key?: string }) => {
-                if (event.key !== 'enter' && event.key !== ' ') return
-                setProjectPath('')
-                setProjectSuggestions([])
-                void suggestPaths('')
-              }}
-              style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}
-            >
-              <Icon name="close" size={13} color={C.ghost} />
-            </div>
-          ) : null}
-        </div>
-
-        {projectSuggestions.length > 0 ? (
+          <text
+            testId="project-path-hint"
+            style={{ fontSize: 11, color: C.muted, paddingTop: 6 }}
+          >
+            {projectRootHint === '~/' ? 'Relative to your home folder.' : `Relative to ${projectRootHint}.`}
+            {'  '}
+            Absolute paths work too.
+          </text>
+          <div style={{ height: 10 }} />
           <div
-            testId="project-suggestions"
-            role="listbox"
-            aria-label="Matching directories"
             style={{
               display: 'flex',
-              flexDirection: 'column',
-              flexGrow: 1,
-              minHeight: 0,
-              maxHeight: 340,
-              overflowY: 'scroll',
-              paddingTop: 6,
-              paddingBottom: 6,
+              flexDirection: 'row',
+              alignItems: 'center',
+              height: 24,
             }}
           >
-            {projectSuggestions.map((suggestion, index) => {
-              const active = index === projectActive
-              // The label is the path relative to the root that was searched.
-              // Repeating the absolute path on every row was the thing that made
-              // this look unfinished: the root is stated once in the footer, and
-              // each row says only what is left to say.
-              const label =
-                projectRoot !== '' && suggestion.path.startsWith(projectRoot)
-                  ? suggestion.path.slice(projectRoot.length).replace(/^\//, '')
-                  : suggestion.name
-              return (
-                <div
-                  key={suggestion.path}
-                  testId={`project-suggestion-${suggestion.path}`}
-                  ref={(instance: PublicInstance | null) => {
-                    // Registered by path so the keyboard handler can find the row
-                    // it just selected without walking the tree.
-                    if (instance) projectRowRefs.current.set(suggestion.path, instance)
-                    else projectRowRefs.current.delete(suggestion.path)
-                  }}
-                  role="option"
-                  aria-selected={active}
-                  // No tabIndex and no key handler on the row. The field keeps
-                  // focus and the arrow keys move the selection, which is the
-                  // listbox pattern: one tab stop for the whole list rather than
-                  // twelve. It also removes a double add — a focused row handled
-                  // Enter itself *and* the window handler added the same
-                  // directory a second time.
-                  onClick={() => void addProject(suggestion.path)}
-                  style={{
-                  // No motion on this row, and that is deliberate. The
-                  // highlight follows the arrow keys, and someone moving
-                  // through a list with the keyboard does it hundreds of times
-                  // a day; animating the selection makes every press feel like
-                  // it is waiting for permission. It snaps.
-                    display: 'flex',
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    gap: 10,
-                    height: 38,
-                    paddingLeft: 12,
-                    paddingRight: 12,
-                    cursor: 'pointer',
-                    backgroundColor: active ? C.overlay : 'transparent',
-                    // Without this the pointer has no way of telling a row from
-                    // the gap below it. Every other control in the shell has it.
-                    hover: { backgroundColor: active ? C.overlayStrong : C.item },
-                  }}
-                >
-                  <Icon name="folder" size={14} color={active ? C.accent : C.tertiary} />
-                  <div
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'row',
-                      alignItems: 'center',
-                      gap: 0,
-                      minWidth: 0,
-                      flexShrink: 1,
-                    }}
-                  >
-                    {highlightRuns(label, suggestion.match).map((run, runIndex) => (
-                      <text
-                        key={runIndex}
-                        style={{
-                          fontSize: 13.5,
-                          color: run.matched ? C.accent : active ? C.text : C.secondary,
-                          // Weight, not a bar. The active row has to be findable
-                          // without relying on colour alone, and a left bar is
-                          // the one way of doing that nobody should be using: it
-                          // is a template tell, and it is not in this app.
-                          fontWeight: run.matched ? 700 : active ? 600 : 400,
-                        }}
-                      >
-                        {run.text}
-                      </text>
-                    ))}
-                  </div>
-                  <div style={{ flexGrow: 1 }} />
-                  <text style={{ fontSize: 11, color: C.muted }}>
-                    {suggestion.mtime ? relativeTime(suggestion.mtime / 1e6, Date.now()) : ''}
-                  </text>
-                </div>
-              )
-            })}
+            <div style={{ flexGrow: 1 }} />
+            <text style={{ fontSize: 11, color: C.muted }}>↵ add</text>
+            <div style={{ width: 12 }} />
+            <text style={{ fontSize: 11, color: C.muted }}>esc close</text>
           </div>
-        ) : projectPending ? (
-          // The search walks the tree, so opening the panel is not instant. An
-          // empty panel with no explanation reads as "nothing found", which is a
-          // different and wrong answer.
-          <text
-            testId="project-searching"
-            style={{ fontSize: 12.5, color: C.muted, paddingLeft: 20, paddingTop: 18, paddingBottom: 18 }}
-          >
-            Searching…
-          </text>
-        ) : projectPath.trim() !== '' ? (
-          <text
-            testId="project-no-results"
-            style={{ fontSize: 12.5, color: C.muted, paddingLeft: 20, paddingTop: 18, paddingBottom: 18 }}
-          >
-            No directory matches that.
-          </text>
-        ) : null}
-
-        {/* A footer that states the count and the keys. A finder with no
-            keyboard legend makes the reader discover arrow keys by accident. */}
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'row',
-            alignItems: 'center',
-            gap: 14,
-            flexShrink: 0,
-            height: 34,
-            paddingLeft: 16,
-            paddingRight: 16,
-            borderTopWidth: 1,
-            borderColor: C.border,
-          }}
-        >
-          {projectRoot !== '' ? (
-            <text testId="project-search-root" style={{ fontSize: 11, color: C.muted, minWidth: 0 }}>
-              {projectSuggestions.length > 0
-                ? projectTotal > projectSuggestions.length
-                  ? `${projectSuggestions.length} of ${projectTotal} in ${projectRoot}`
-                  : `${projectTotal} in ${projectRoot}`
-                : projectRoot}
-            </text>
-          ) : null}
-          <div style={{ flexGrow: 1 }} />
-          <text style={{ fontSize: 11, color: C.muted }}>↑↓ move</text>
-          <text style={{ fontSize: 11, color: C.muted }}>home/end jump</text>
-          <text style={{ fontSize: 11, color: C.muted }}>↵ add</text>
-          <text style={{ fontSize: 11, color: C.muted }}>esc close</text>
         </div>
       </OverlayCard>
       </>
