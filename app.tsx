@@ -1179,7 +1179,16 @@ function Sidebar({
           A section that implies concurrency the engine does not have is worse
           than no section; it goes in when the engine can populate it. */}
 
+      {/* Claims the height between the project list and the footer. Nothing
+          else in this column grows, so without it the settings row sat directly
+          under the last project and rode up with the content as the window got
+          taller, rather than staying at the bottom of the sidebar. It goes here
+          rather than after the agents section so that when that arrives it lands
+          on the bottom, above the footer, which is where it is meant to be. */}
+      <div style={{ flexGrow: 1, minHeight: 0 }} />
+
       <div
+        testId="sidebar-footer"
         style={{
           display: 'flex',
           flexDirection: 'row',

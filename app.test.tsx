@@ -3012,3 +3012,64 @@ describe('project list order', () => {
     }
   })
 })
+
+describe('sidebar footer placement', () => {
+  // The settings row sat directly under the last project and rode up with the
+  // content as the window got taller, because nothing in the sidebar column
+  // claimed the remaining height. Asserted on real geometry rather than on the
+  // source, because the harness has no layout engine but it does report
+  // element bounds, and "where is it on screen" is the actual claim.
+  const bounds = (renderer: TestRenderer, id: string) => {
+    const el = renderer.findByTestId(id)
+    expect(el, `${id} should exist`).toBeDefined()
+    const get = (renderer as unknown as {
+      getElementBounds: (id: number) => { x: number; y: number; width: number; height: number }
+      getWindowSize: () => { width: number; height: number }
+    })
+    return {
+      footer: get.getElementBounds(el!.id),
+      window: get.getWindowSize(),
+    }
+  }
+
+  it('sits at the bottom of the sidebar, not under the last project', async () => {
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/Projects/a' },
+      { path: '/Users/tester/Projects/b' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      const { footer, window: size } = bounds(renderer, 'sidebar-footer')
+      expect(footer.y + footer.height).toBe(size.height)
+      // And it is not riding up under the content: the project list ends well
+      // above it, so there is empty column in between.
+      const list = bounds(renderer, 'sidebar-projects')
+      expect(list.footer.y + list.footer.height).toBeLessThan(footer.y)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('stays at the bottom when the list is long enough to scroll', async () => {
+    // The list caps at 45% and scrolls, so this is the case where the footer and
+    // the list could collide if the spacer were not taking the remainder.
+    const fake = new FakeEngine()
+    fake.projects = Array.from({ length: 30 }, (_, i) => ({ path: `/Users/tester/Projects/p${i}` }))
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      const { footer, window: size } = bounds(renderer, 'sidebar-footer')
+      const list = bounds(renderer, 'sidebar-projects')
+      expect(footer.y + footer.height).toBe(size.height)
+      expect(list.footer.y + list.footer.height).toBeLessThanOrEqual(footer.y)
+    } finally {
+      await app.close()
+    }
+  })
+})
