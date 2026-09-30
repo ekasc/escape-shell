@@ -14,6 +14,7 @@ import os from 'os'
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { C, type Palette } from './theme-tokens'
 import { isActivate, normaliseKey } from './keys'
+import { useFocusRing } from './focus'
 import { DURATION, fadeIn } from './motion'
 import { DesignRun, type DesignOutcome, type DesignPhase } from './design-run'
 import { createEscapeAgentClient, TRANSCRIPT_PAGE } from './agent-client'
@@ -64,17 +65,29 @@ function Button({
   children?: React.ReactNode
   [key: string]: unknown
 }) {
+  // The ring lives here rather than at each call site: this is the shim nearly
+  // every control renders through, and adding it per control is how twenty of
+  // them ended up with no indicator at all.
+  const ring = useFocusRing()
   return (
     <div
       testId={testId}
       role="button"
       aria-disabled={disabled || undefined}
       tabIndex={disabled ? -1 : 0}
+      onFocus={ring.focusProps.onFocus}
+      onBlur={ring.focusProps.onBlur}
       onClick={disabled ? undefined : onClick}
       onKeyDown={(event: { key?: string }) => {
         if (!disabled && onClick && (isActivate(event.key))) onClick()
       }}
-      style={{ ...(style as object), cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.35 : (style as { opacity?: number } | undefined)?.opacity }}
+      style={{
+        ...ring.style,
+        ...(style as object),
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.35 : (style as { opacity?: number } | undefined)?.opacity,
+        ...ring.style,
+      }}
       {...(rest as object)}
     >
       {children}
@@ -183,14 +196,17 @@ function DialogClose({
   style?: StyleDesc
   children?: React.ReactNode
 }) {
+  const ring = useFocusRing()
   const { close } = React.useContext(DialogContext)
   return (
     <div testId={testId} role="button" aria-label="Close" tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
       onClick={close}
       onKeyDown={(event: { key?: string }) => {
         if (isActivate(event.key)) close()
       }}
-      style={{ ...(style as object), cursor: 'pointer' }}>
+      style={{ ...(style as object), cursor: 'pointer' , ...ring.style }}>
       {children}
     </div>
   )
@@ -849,6 +865,7 @@ function ProjectRow({
   current: boolean
   onSelect: (path: string) => void
 }) {
+  const ring = useFocusRing()
   return (
     <div
       testId={`sidebar-project-${project.path}`}
@@ -861,12 +878,15 @@ function ProjectRow({
       aria-selected={current}
       aria-label={current ? `${projectName(project.path)}, current project` : projectName(project.path)}
       tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
       onClick={() => onSelect(project.path)}
       onKeyDown={(event: { key?: string }) => {
         const key = normaliseKey(event.key)
         if (key === 'enter' || key === 'space') onSelect(project.path)
       }}
       style={{
+        ...ring.style,
         display: 'flex',
         flexDirection: 'row',
         alignItems: 'center',
@@ -1252,6 +1272,7 @@ function WorkedFor({
   duration: string
   tools?: { name: string; status: 'running' | 'done' | 'error'; args?: string }[]
 }) {
+  const ring = useFocusRing()
   const [open, setOpen] = useState(false)
   const running = tools?.some((t) => t.status === 'running') ?? false
   return (
@@ -1262,12 +1283,15 @@ function WorkedFor({
       <div
         role="button"
         tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
         aria-expanded={open}
         aria-label={duration}
         testId="work-fold-toggle"
         onClick={() => setOpen((value) => !value)}
         onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) setOpen((value) => !value) }}
         style={{
+          ...ring.style,
           display: 'flex',
           flexDirection: 'row',
           alignItems: 'center',
@@ -1455,6 +1479,7 @@ function CopyButton({
   /** Resolves once the clipboard write actually lands; rejects if it did not. */
   onCopy: (text: string) => Promise<void>
 }) {
+  const ring = useFocusRing()
   const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => () => {
@@ -1478,12 +1503,15 @@ function CopyButton({
       testId={testId}
       role="button"
       tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
       // Icon only, so the accessible name is what a sighted user reads on
       // hover. A glyph with no name is invisible to a screen reader.
       aria-label={failed ? `Copy ${label ?? ''} failed` : copied ? 'Copied' : `Copy ${label ?? ''}`}
       onClick={press}
       onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) press() }}
       style={{
+        ...ring.style,
         display: 'flex', flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
         width: 22, height: 20, borderRadius: 5,
         cursor: 'pointer', flexShrink: 0,
@@ -2196,6 +2224,7 @@ function Switch({
   testId?: string
   label: string
 }) {
+  const ring = useFocusRing()
   return (
     <div
       testId={testId}
@@ -2203,11 +2232,14 @@ function Switch({
       aria-checked={checked}
       aria-label={label}
       tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
       onClick={() => onChange(!checked)}
       onKeyDown={(event: { key?: string }) => {
         if (isActivate(event.key)) onChange(!checked)
       }}
       style={{
+        ...ring.style,
         width: 40,
         height: 24,
         flexShrink: 0,
@@ -3642,6 +3674,7 @@ function Header({
   onToggleDiff: () => void
   onToggleGit: () => void
 }) {
+  const ring = useFocusRing()
   return (
     <div
       style={{
@@ -3688,11 +3721,14 @@ function Header({
           role="button"
           aria-label={`Git branch ${gitBranch}${gitDirty ? `, ${gitDirty} changes` : ''}`}
           tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
           onClick={onToggleGit}
           onKeyDown={(e: { key?: string }) => {
             if (isActivate(e.key)) onToggleGit()
           }}
           style={{
+            ...ring.style,
             display: 'flex',
             flexDirection: 'row',
             alignItems: 'center',
@@ -4148,6 +4184,7 @@ function DesignToggle({
   busy: boolean
   onToggle: () => void
 }) {
+  const ring = useFocusRing()
   return (
     <div
       testId="design-toggle"
@@ -4155,11 +4192,14 @@ function DesignToggle({
       aria-checked={on}
       aria-label="Design Mode"
       tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
       onClick={onToggle}
       onKeyDown={(event: { key?: string }) => {
         if (isActivate(event.key)) onToggle()
       }}
       style={{
+        ...ring.style,
         display: 'flex',
         flexDirection: 'row',
         alignItems: 'center',
@@ -4674,6 +4714,7 @@ function Composer({
   designBusy: boolean
   onToggleDesign: () => void
 }) {
+  const ring = useFocusRing()
   const composerRef = useRef<PublicInstance | null>(null)
   const { renderer } = useGpuix()
   useEffect(() => {
@@ -4758,11 +4799,14 @@ function Composer({
             role="button"
             aria-label={busy ? 'Stop the running turn' : 'Send message'}
             tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
             onClick={() => (busy ? onStop() : send(value))}
             onKeyDown={(event: { key?: string }) => {
               if (isActivate(event.key)) busy ? onStop() : send(value)
             }}
             style={{
+              ...ring.style,
               width: 26,
               height: 26,
               borderRadius: 13,
@@ -5242,6 +5286,7 @@ function DiffOverlay({
   layout: 'stacked' | 'side-by-side'
   onLayoutChange: (next: 'stacked' | 'side-by-side') => void
 }) {
+  const ring = useFocusRing()
   const files = useMemo(() => parseUnifiedDiff(patch), [patch])
   const [selected, setSelected] = useState<string | null>(null)
   useEffect(() => {
@@ -5305,11 +5350,14 @@ function DiffOverlay({
                   aria-checked={layout === option}
                   aria-label={option === 'stacked' ? 'Stacked' : 'Side by side'}
                   tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
                   onClick={() => onLayoutChange(option)}
                   onKeyDown={(event: { key?: string }) => {
                     if (isActivate(event.key)) onLayoutChange(option)
                   }}
                   style={{
+                    ...ring.style,
                     paddingLeft: 10,
                     paddingRight: 10,
                     height: 28,
@@ -5487,6 +5535,7 @@ function ChangesPanel({
   onCommit: (message: string, paths?: string[]) => void
   maxHeight: string
 }) {
+  const ring = useFocusRing()
   const [message, setMessage] = useState('')
   const [expanded, setExpanded] = useState({ staged: true, unstaged: true })
   const [showCommitBox, setShowCommitBox] = useState(false)
@@ -5542,10 +5591,13 @@ function ChangesPanel({
           testId={`git-section-${key}-toggle`}
           role="button"
           tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
           aria-expanded={open}
           onClick={() => toggle(key)}
           onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) toggle(key) }}
           style={{
+            ...ring.style,
             display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6,
             height: 28, paddingLeft: 8, paddingRight: 8,
             backgroundColor: C.composer, cursor: 'pointer', hover: { backgroundColor: C.overlay },
@@ -5559,10 +5611,13 @@ function ChangesPanel({
             testId={`git-section-${key}-all`}
             role="button"
             tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
             aria-label={key === 'staged' ? `Unstage all ${label.toLowerCase()}` : `Stage all ${label.toLowerCase()}`}
             onClick={() => action()}
             onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) action() }}
             style={{
+              ...ring.style,
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               height: 20, paddingLeft: 6, paddingRight: 6, borderRadius: 5,
               cursor: 'pointer', hover: { backgroundColor: C.overlay },
@@ -5584,10 +5639,13 @@ function ChangesPanel({
             testId={`git-file-${f.path}`}
             role="button"
             tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
             aria-pressed={isSelected}
             onClick={() => onSelectPath(isSelected ? null : f.path)}
             onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) onSelectPath(isSelected ? null : f.path) }}
             style={{
+              ...ring.style,
               display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6,
               height: 24, paddingLeft: 22, paddingRight: 8,
               backgroundColor: isSelected ? C.overlayStrong : 'transparent',
@@ -5602,10 +5660,13 @@ function ChangesPanel({
               testId={`git-file-action-${f.path}`}
               role="button"
               tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
               aria-label={key === 'staged' ? `Unstage ${f.path}` : `Stage ${f.path}`}
               onClick={() => action([f.path])}
               onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) action([f.path]) }}
               style={{
+                ...ring.style,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 width: 18, height: 18, borderRadius: 4, cursor: 'pointer', hover: { backgroundColor: C.overlayStrong },
               }}
@@ -5677,10 +5738,13 @@ function ChangesPanel({
                   testId="git-commit-submit"
                   role="button"
                   tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
                   aria-disabled={message.trim() === ''}
                   onClick={() => commit()}
                   onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) commit() }}
                   style={{
+                    ...ring.style,
                     display: 'flex', alignItems: 'center', gap: 5, height: 24,
                     paddingLeft: 10, paddingRight: 10, borderRadius: 7,
                     backgroundColor: message.trim() === '' ? C.raised : C.accent,
@@ -5695,10 +5759,12 @@ function ChangesPanel({
                   testId="git-commit-cancel"
                   role="button"
                   tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
                   aria-label="Cancel commit"
                   onClick={() => { setShowCommitBox(false); setMessage('') }}
                   onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) { setShowCommitBox(false); setMessage('') } }}
-                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: C.overlay } , ...ring.style }}
                 >
                   <text style={{ fontSize: 13, color: C.secondary }}>{'\u2715'}</text>
                 </div>
@@ -5712,9 +5778,12 @@ function ChangesPanel({
               testId="git-commit-open"
               role="button"
               tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
               onClick={() => setShowCommitBox(true)}
               onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) setShowCommitBox(true) }}
               style={{
+                ...ring.style,
                 display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6,
                 height: 24, paddingLeft: 8, paddingRight: 8, borderRadius: 7,
                 cursor: 'pointer', hover: { backgroundColor: C.overlay },
@@ -5771,6 +5840,7 @@ function GitSidebar({
   onOpenFullDiff: () => void
   onFileDiff: (path: string) => Promise<string>
 }) {
+  const ring = useFocusRing()
   // Resolve which patch the viewer shows, from the source dropdown.
   const displayPatch = useMemo(() => {
     const turnIds = Object.keys(turnDiffs).sort((a, b) => (turnTimes[b] ?? 0) - (turnTimes[a] ?? 0))
@@ -5855,6 +5925,7 @@ function GitSidebar({
           // file names behind it. The panel keeps its own userSelect for the
           // content, but the handle opts out for itself and its subtree.
           userSelect: 'none',
+          ...ring.style,
         }}
         role="separator"
         aria-orientation="vertical"
@@ -5863,6 +5934,8 @@ function GitSidebar({
         aria-valuemin={280}
         aria-valuemax={maxW}
         tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
         onKeyDown={(e: { key?: string }) => {
           // GPUIX's key payload carries no modifier state, so there is no
           // shift-for-coarse-step; each press is a fixed 12px.
@@ -5939,6 +6012,8 @@ function GitSidebar({
             aria-valuemin={12}
             aria-valuemax={80}
             tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
             onMouseDown={(e: { x?: number; y?: number }) => {
               clearTextSelection()
               splitDrag.current = { y: e.y ?? 0, pct: listPct }
@@ -5961,6 +6036,7 @@ function GitSidebar({
               if (normaliseKey(e.key) === 'down') { setListPct(p => Math.min(80, p + step)); clearTextSelection() }
             }}
             style={{
+              ...ring.style,
               // 12px tall rather than 8: the visible rule is 2px, but the hit
               // target is the whole strip, and a 2px target is not hittable.
               height: 12,
@@ -6055,10 +6131,12 @@ function GitSidebar({
                     testId="git-diff-file-clear"
                     role="button"
                     tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
                     aria-label="Show all files"
                     onClick={() => setSelectedPath(null)}
                     onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) setSelectedPath(null) }}
-                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 20, height: 20, borderRadius: 5, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 20, height: 20, borderRadius: 5, cursor: 'pointer', hover: { backgroundColor: C.overlay } , ...ring.style }}
                   >
                     <text style={{ fontSize: 13, color: C.secondary }}>{'×'}</text>
                   </div>
@@ -6152,6 +6230,7 @@ function GitSidebar({
 
 
 function TurnDiff({ patch, onOpenDiff }: { patch: string; onOpenDiff?: () => void }) {
+  const ring = useFocusRing()
   const files = useMemo(() => parseUnifiedDiff(patch), [patch])
   const totalAdded = files.reduce((a, f) => a + f.added, 0)
   const totalRemoved = files.reduce((a, f) => a + f.removed, 0)
@@ -6194,9 +6273,11 @@ function TurnDiff({ patch, onOpenDiff }: { patch: string; onOpenDiff?: () => voi
                 testId={`turn-folder-${folder}`}
                 role="button"
                 tabIndex={0}
+  onFocus={ring.focusProps.onFocus}
+  onBlur={ring.focusProps.onBlur}
                 onClick={() => toggleFolder(folder)}
                 onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) toggleFolder(folder) }}
-                style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, height: 26, paddingLeft: 8, paddingRight: 8, borderRadius: 7, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}
+                style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, height: 26, paddingLeft: 8, paddingRight: 8, borderRadius: 7, cursor: 'pointer', hover: { backgroundColor: C.overlay } , ...ring.style }}
               >
                 <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={10} color={C.tertiary} />
                 <Icon name="folder" size={12} color={C.tertiary} />
@@ -6205,9 +6286,9 @@ function TurnDiff({ patch, onOpenDiff }: { patch: string; onOpenDiff?: () => voi
                 <text style={{ fontSize: 11, color: C.error }}>{`-${data.removed}`}</text>
               </div>
               {isOpen && data.files.map(f => (
-                <div key={f.path} testId={`turn-file-${f.path}`} role="button" tabIndex={0} onClick={() => onOpenDiff?.()} style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, height: 24, paddingLeft: 32, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}>
+                <div key={f.path} testId={`turn-file-${f.path}`} role="button" tabIndex={0} onFocus={ring.focusProps.onFocus} onBlur={ring.focusProps.onBlur} onClick={() => onOpenDiff?.()} style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, height: 24, paddingLeft: 32, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: C.overlay }, ...ring.style , ...ring.style }}>
                   <Icon name="file" size={10} color={C.tertiary} />
-                  <text style={{ fontSize: 11, color: C.secondary, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{f.path.split('/').pop()}</text>
+                  <text style={{ fontSize: 11, color: C.secondary, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis' , ...ring.style }}>{f.path.split('/').pop()}</text>
                   <text style={{ fontSize: 10, color: C.success }}>{f.added ? `+${f.added}` : ''}</text>
                   <text style={{ fontSize: 10, color: C.error }}>{f.removed ? `-${f.removed}` : ''}</text>
                 </div>

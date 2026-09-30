@@ -16,7 +16,9 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { motion, render, resetRender } from '@gpuix/react'
 import { DURATION, __setReducedMotionForTest, fadeIn } from './motion'
 import { normaliseKey } from './keys'
+import { focusRingForTest } from './focus'
 import { resolveEngineCwd } from './agent-client'
+import { C } from './theme-tokens'
 import { connectTest } from '@gpuix/react/automation'
 import { createTestRoot, hasNativeTestRenderer, TestRenderer } from '@gpuix/react/testing'
 import {
@@ -3150,5 +3152,46 @@ describe('keyboard activation', () => {
     } finally {
       await app.close()
     }
+  })
+})
+
+describe('focus indication', () => {
+  // WCAG 2.4.7 asks for a visible focus indicator and the app had none: there
+  // was no focus handling anywhere, so a person tabbing through the controls
+  // could not tell which one they were on. The style description offers hover
+  // and active variants and nothing for focus, so it is drawn from the focus
+  // events as an inset shadow, which costs no layout.
+  it('draws a ring when a control takes focus', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      // What the harness cannot do is asserted here rather than skipped: it
+      // consumes `style` itself, so the resolved value is never exposed through
+      // customProps, and there is no way to observe a resolved shadow. So the
+      // claim is made against the shim's source, which is the one place every
+      // control in the app gets the ring from, and the ring's geometry is
+      // asserted directly below. Claiming more than this from a test would be
+      // claiming something it cannot see.
+      const source = fs.readFileSync(path.join(__dirname, 'app.tsx'), 'utf8')
+      const shim = source.slice(source.indexOf('function Button({'), source.indexOf('const DialogContext'))
+      expect(shim).toContain('onFocus={ring.focusProps.onFocus}')
+      expect(shim).toContain('...ring.style')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('is drawn inset, so it cannot move the layout', () => {
+    // A border would shift every control by its own width, and a fill would be
+    // indistinguishable from hover, which is already a fill in this app. The
+    // negative spread is what keeps it inside the control's own bounds.
+    const ring = focusRingForTest()
+    expect(ring.spreadRadius).toBeLessThan(0)
+    expect(ring.offsetX).toBe(0)
+    expect(ring.offsetY).toBe(0)
+    expect(ring.color).toBe(C.accent)
   })
 })
