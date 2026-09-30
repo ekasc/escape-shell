@@ -8,13 +8,15 @@
  */
 
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import React from 'react'
-import { beforeAll, describe, expect, it } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { motion, render, resetRender } from '@gpuix/react'
 import { DURATION, __setReducedMotionForTest, fadeIn } from './motion'
 import { normaliseKey } from './keys'
+import { resolveEngineCwd } from './agent-client'
 import { connectTest } from '@gpuix/react/automation'
 import { createTestRoot, hasNativeTestRenderer, TestRenderer } from '@gpuix/react/testing'
 import {
@@ -3197,5 +3199,54 @@ describeNative('sidebar projects and recent sessions', () => {
     } finally {
       await app.close()
     }
+  })
+})
+
+describe('engine working directory', () => {
+  // macOS hands a Finder-launched app "/" as its working directory, so the
+  // installed app would adopt the filesystem root as the project and scope the
+  // session list to a directory nobody chose.
+  const originalCwd = process.cwd
+  const originalEnv = process.env.ESCAPE_CWD
+
+  const withCwd = (value: string, fn: () => void): void => {
+    Object.defineProperty(process, 'cwd', { value: () => value, configurable: true })
+    try {
+      fn()
+    } finally {
+      Object.defineProperty(process, 'cwd', { value: originalCwd, configurable: true })
+    }
+  }
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.ESCAPE_CWD
+    else process.env.ESCAPE_CWD = originalEnv
+  })
+
+  it('falls back to the home directory when launched from Finder', () => {
+    withCwd('/', () => {
+      expect(resolveEngineCwd()).toBe(os.homedir())
+      expect(resolveEngineCwd()).not.toBe('/')
+    })
+  })
+
+  it('keeps a real working directory', () => {
+    withCwd('/Users/tester/Projects/alpha', () => {
+      expect(resolveEngineCwd()).toBe('/Users/tester/Projects/alpha')
+    })
+  })
+
+  it('lets ESCAPE_CWD win over the fallback', () => {
+    process.env.ESCAPE_CWD = '/Users/tester/Projects/beta'
+    withCwd('/', () => {
+      expect(resolveEngineCwd()).toBe('/Users/tester/Projects/beta')
+    })
+  })
+
+  it('prefers an explicit argument over everything', () => {
+    process.env.ESCAPE_CWD = '/Users/tester/Projects/beta'
+    withCwd('/', () => {
+      expect(resolveEngineCwd('/Users/tester/Projects/gamma')).toBe('/Users/tester/Projects/gamma')
+    })
   })
 })

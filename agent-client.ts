@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 /** How a turn finished. `interrupted` is the user cutting it short, not a failure. */
@@ -1413,10 +1414,31 @@ function resolveEngineCommand(explicit?: string): string {
   return 'escape'
 }
 
+/**
+ * The directory the engine starts in.
+ *
+ * macOS hands a Finder-launched app the filesystem root as its working
+ * directory, so `process.cwd()` is "/" for exactly the runs that matter most:
+ * the installed app. The engine would then adopt the root as the project, and
+ * the session list would be scoped to a directory nobody chose.
+ *
+ * ESCAPE_CWD is the explicit override, and $HOME is the fallback because it is
+ * the one directory a person is always willing to be working in. A cwd given by
+ * a caller, and the terminal's own directory, are both left alone.
+ */
+export function resolveEngineCwd(explicit?: string): string {
+  if (explicit && explicit.trim() !== '') return explicit
+  const fromEnv = process.env.ESCAPE_CWD
+  if (fromEnv && fromEnv.trim() !== '') return fromEnv
+  const current = process.cwd()
+  if (current === '/' || current === '') return homedir()
+  return current
+}
+
 export function createEscapeAgentClient(options: { command?: string; cwd?: string } = {}): AgentClient {
   return new EscapeAgentClient({
     command: resolveEngineCommand(options.command),
-    cwd: options.cwd ?? process.cwd(),
+    cwd: resolveEngineCwd(options.cwd),
   })
 }
 

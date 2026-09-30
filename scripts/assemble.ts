@@ -80,7 +80,14 @@ function payload(dest: string): void {
   const launcher = join(dest, 'escape-shell')
   writeFileSync(launcher, LAUNCHER.replace('{{BIN}}', 'bin').replace('{{APP}}', 'app'))
   chmodSync(launcher, 0o755)
-  cpSync(launcher, join(dest, 'bin', 'escape-shell')) // convenience alias
+  // A second launcher beside the runtime, so `Contents/Resources/bin/escape-shell`
+  // works too. It is written rather than copied, because the paths are relative
+  // to the launcher's own directory: copying the one above put it in bin/ still
+  // looking for bin/bin/bun and bin/app/shell.js, neither of which exists. The
+  // copy ran, and failed, only when something invoked that path.
+  const binLauncher = join(dest, 'bin', 'escape-shell')
+  writeFileSync(binLauncher, LAUNCHER.replace('{{BIN}}', '.').replace('{{APP}}', '../app'))
+  chmodSync(binLauncher, 0o755)
 }
 
 function flat(): void {
