@@ -37,6 +37,7 @@ export class FakeEngine implements AgentClient {
   readonly mode = 'engine' as const
   calls: { method: string; args: unknown[] }[] = []
   closed = false
+  defaultProject = ''
   stopped = false
   sent: { prompt: string; attachments: string[] }[] = []
 
@@ -49,6 +50,7 @@ export class FakeEngine implements AgentClient {
     provider: 'opencode-go',
     thinkingLevel: 'medium',
     titleModel: '',
+    defaultProject: '',
     apiEndpointBaseURL: 'https://api.openai.com/v1',
     approvalMode: 'auto',
     autoCompaction: false,
@@ -605,6 +607,14 @@ export class FakeEngine implements AgentClient {
       p.id === 'api' ? { ...p, configured: true } : p,
     )
     void apiKey
+  }
+
+  async setDefaultProject(path: string): Promise<{ defaultProject: string; cwd: string }> {
+    this.calls.push({ method: 'setDefaultProject', args: [path] })
+    this.fail('setDefaultProject')
+    this.defaultProject = path
+    if (path !== '') this.state = { ...this.state, cwd: path }
+    return { defaultProject: this.defaultProject, cwd: this.state.cwd }
   }
 
   async setTitleModel(model: string): Promise<void> {

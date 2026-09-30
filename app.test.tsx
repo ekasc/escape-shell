@@ -3203,50 +3203,100 @@ describeNative('sidebar projects and recent sessions', () => {
 })
 
 describe('engine working directory', () => {
-  // macOS hands a Finder-launched app "/" as its working directory, so the
-  // installed app would adopt the filesystem root as the project and scope the
-  // session list to a directory nobody chose.
-  const originalCwd = process.cwd
+  // The client used to substitute the home directory when it saw "/", which is
+  // what macOS hands a Finder-opened app. That quietly won over the engine's
+  // defaultProject setting, because the engine never saw the root to reject.
+  // The engine owns the decision now; the client only passes a real directory
+  // through.
   const originalEnv = process.env.ESCAPE_CWD
-
-  const withCwd = (value: string, fn: () => void): void => {
-    Object.defineProperty(process, 'cwd', { value: () => value, configurable: true })
-    try {
-      fn()
-    } finally {
-      Object.defineProperty(process, 'cwd', { value: originalCwd, configurable: true })
-    }
-  }
 
   afterEach(() => {
     if (originalEnv === undefined) delete process.env.ESCAPE_CWD
     else process.env.ESCAPE_CWD = originalEnv
   })
 
-  it('falls back to the home directory when launched from Finder', () => {
-    withCwd('/', () => {
-      expect(resolveEngineCwd()).toBe(os.homedir())
-      expect(resolveEngineCwd()).not.toBe('/')
-    })
+  it('passes a real working directory through untouched', () => {
+    expect(resolveEngineCwd('/Users/tester/Projects/alpha')).toBe('/Users/tester/Projects/alpha')
   })
 
-  it('keeps a real working directory', () => {
-    withCwd('/Users/tester/Projects/alpha', () => {
-      expect(resolveEngineCwd()).toBe('/Users/tester/Projects/alpha')
-    })
+  it('passes the root through for the engine to reject', () => {
+    // Not "/" becoming something else. The engine is the only thing that knows
+    // what the configured default is, and pre-empting it here is what made the
+    // setting do nothing.
+    expect(resolveEngineCwd('/')).toBe('/')
   })
 
-  it('lets ESCAPE_CWD win over the fallback', () => {
+  it('does not invent a directory when the caller has none', () => {
+    delete process.env.ESCAPE_CWD
+    expect(resolveEngineCwd(undefined)).toBe(process.cwd())
+    expect(resolveEngineCwd('   ')).toBe(process.cwd())
+  })
+
+  it('lets ESCAPE_CWD override everything except an explicit argument', () => {
     process.env.ESCAPE_CWD = '/Users/tester/Projects/beta'
-    withCwd('/', () => {
-      expect(resolveEngineCwd()).toBe('/Users/tester/Projects/beta')
-    })
+    expect(resolveEngineCwd(undefined)).toBe('/Users/tester/Projects/beta')
+    expect(resolveEngineCwd('/Users/tester/Projects/gamma')).toBe(
+      '/Users/tester/Projects/gamma',
+    )
+  })
+})
+
+describe('starting directory setting', () => {
+  it('shows the engine\'s value rather than an empty field', async () => {
+    const fake = new FakeEngine()
+    fake.state = { ...fake.state, defaultProject: '/Users/tester/Projects/alpha' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await settle(renderer)
+      const field = renderer.findByTestId('settings-start-dir')
+      expect(field).toBeDefined()
+      expect(String(field?.customProps?.value)).toBe('/Users/tester/Projects/alpha')
+    } finally {
+      await app.close()
+    }
   })
 
-  it('prefers an explicit argument over everything', () => {
-    process.env.ESCAPE_CWD = '/Users/tester/Projects/beta'
-    withCwd('/', () => {
-      expect(resolveEngineCwd('/Users/tester/Projects/gamma')).toBe('/Users/tester/Projects/gamma')
-    })
+  it('writes through the engine when the value is set', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await settle(renderer)
+      const field = renderer.findByTestId('settings-start-dir')!
+      renderer.nativeSimulateKeystrokes(field.id, '/Users/tester/Projects/beta'.split('').join(' '))
+      await settle(renderer)
+      await app.getByTestId('settings-start-dir-apply').click()
+      await settle(renderer)
+      expect(
+        fake.calls.find((c) => c.method === 'setDefaultProject')?.args?.[0],
+      ).toBe('/Users/tester/Projects/beta')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('clears the value, which hands the decision back to the home directory', async () => {
+    const fake = new FakeEngine()
+    fake.state = { ...fake.state, defaultProject: '/Users/tester/Projects/alpha' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await settle(renderer)
+      await app.getByTestId('settings-start-dir-clear').click()
+      await settle(renderer)
+      expect(fake.calls.find((c) => c.method === 'setDefaultProject')?.args?.[0]).toBe('')
+    } finally {
+      await app.close()
+    }
   })
 })

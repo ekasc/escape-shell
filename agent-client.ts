@@ -1,5 +1,4 @@
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 /** How a turn finished. `interrupted` is the user cutting it short, not a failure. */
@@ -135,6 +134,8 @@ export interface AgentClient {
   removeApiKey(provider: 'opencode-go' | 'opencode-zen' | 'api'): Promise<void>
   setApiEndpoint(baseURL: string, apiKey: string): Promise<void>
   setTitleModel(model: string): Promise<void>
+  /** The directory a session starts in when nothing else says. Empty clears it. */
+  setDefaultProject(path: string): Promise<{ defaultProject: string; cwd: string }>
   setApprovalMode(mode: 'auto' | 'ask'): Promise<void>
   setAutoCompaction(enabled: boolean): Promise<void>
   setAutoRetry(enabled: boolean): Promise<void>
@@ -403,6 +404,8 @@ export type AgentState = {
   thinkingLevel: string
   titleModel: string
   apiEndpointBaseURL: string
+  /** The directory a session opens in when nothing else says. */
+  defaultProject: string
   approvalMode: string
   autoCompaction: boolean
   autoRetry: boolean
@@ -712,7 +715,7 @@ export function createLocalAgentClient(reply: (prompt: string) => string): Agent
     async newSession() { return null },
     async switchSession() { return null },
     async setSessionName() {},
-    async getState() { return { state: 'idle', sessionId: 'local', sessionFile: '', cwd: '', model: 'local', provider: 'local', thinkingLevel: 'off', titleModel: '', apiEndpointBaseURL: '', approvalMode: 'auto', autoCompaction: false, autoRetry: false, steeringMode: 'one-at-a-time', followUpMode: 'one-at-a-time', maxTokens: 0 } },
+    async getState() { return { state: 'idle', sessionId: 'local', sessionFile: '', cwd: '', model: 'local', provider: 'local', thinkingLevel: 'off', titleModel: '', apiEndpointBaseURL: '', defaultProject: '', approvalMode: 'auto', autoCompaction: false, autoRetry: false, steeringMode: 'one-at-a-time', followUpMode: 'one-at-a-time', maxTokens: 0 } },
     async ping() { return true },
     async getProviders() { return [{ id: 'local', name: 'Local preview', configured: true }] },
     async getCommands() { return [] },
@@ -745,6 +748,7 @@ export function createLocalAgentClient(reply: (prompt: string) => string): Agent
     async removeApiKey() {},
     async setApiEndpoint() {},
     async setTitleModel() {},
+    async setDefaultProject(path: string) { return { defaultProject: path, cwd: path } },
     async setApprovalMode() {},
     async setAutoCompaction() {},
     async setAutoRetry() {},
@@ -996,7 +1000,7 @@ export class EscapeAgentClient implements AgentClient {
 
   async getState(): Promise<AgentState> {
     const data = await this.request({ type: 'get_state' })
-    if (!isRecord(data)) return { state: '', sessionId: '', sessionFile: '', cwd: '', model: '', provider: '', thinkingLevel: '', titleModel: '', apiEndpointBaseURL: '', approvalMode: 'auto', autoCompaction: false, autoRetry: false, steeringMode: 'one-at-a-time', followUpMode: 'one-at-a-time', maxTokens: 0 }
+    if (!isRecord(data)) return { state: '', sessionId: '', sessionFile: '', cwd: '', model: '', provider: '', thinkingLevel: '', titleModel: '', apiEndpointBaseURL: '', defaultProject: '', approvalMode: 'auto', autoCompaction: false, autoRetry: false, steeringMode: 'one-at-a-time', followUpMode: 'one-at-a-time', maxTokens: 0 }
     return {
       state: readString(data, 'state') ?? '',
       sessionId: readString(data, 'sessionId') ?? '',
@@ -1006,6 +1010,7 @@ export class EscapeAgentClient implements AgentClient {
       provider: readString(data, 'provider') ?? '',
       thinkingLevel: readString(data, 'thinkingLevel') ?? '',
       apiEndpointBaseURL: readString(data, 'apiEndpointBaseURL') ?? '',
+      defaultProject: readString(data, 'defaultProject') ?? '',
       titleModel: readString(data, 'titleModel') ?? '',
       approvalMode: readString(data, 'approvalMode') ?? 'auto',
       autoCompaction: data.autoCompaction === true,
@@ -1289,6 +1294,15 @@ export class EscapeAgentClient implements AgentClient {
     await this.request({ type: 'set_api_endpoint', baseURL, apiKey })
   }
 
+  async setDefaultProject(path: string): Promise<{ defaultProject: string; cwd: string }> {
+    const data = await this.request({ type: 'set_default_project', sessionPath: path })
+    if (!isRecord(data)) return { defaultProject: '', cwd: '' }
+    return {
+      defaultProject: readString(data, 'defaultProject') ?? '',
+      cwd: readString(data, 'cwd') ?? '',
+    }
+  }
+
   async setTitleModel(model: string): Promise<void> {
     await this.request({ type: 'set_title_model', model })
   }
@@ -1415,24 +1429,23 @@ function resolveEngineCommand(explicit?: string): string {
 }
 
 /**
- * The directory the engine starts in.
+ * The directory the engine is asked to start in.
  *
- * macOS hands a Finder-launched app the filesystem root as its working
- * directory, so `process.cwd()` is "/" for exactly the runs that matter most:
- * the installed app. The engine would then adopt the root as the project, and
- * the session list would be scoped to a directory nobody chose.
+ * This deliberately does not guess. macOS opens a Finder-launched app in the
+ * filesystem root, which is a directory and therefore looks like an answer, so
+ * the engine is the one that has to reject it: it owns the `defaultProject`
+ * setting and knows the home directory. Substituting a fallback here would
+ * quietly win over that setting, and the field in the settings screen would
+ * stop having any effect.
  *
- * ESCAPE_CWD is the explicit override, and $HOME is the fallback because it is
- * the one directory a person is always willing to be working in. A cwd given by
- * a caller, and the terminal's own directory, are both left alone.
+ * A real directory from the terminal is passed through untouched, and
+ * ESCAPE_CWD is an explicit override for either case.
  */
 export function resolveEngineCwd(explicit?: string): string {
   if (explicit && explicit.trim() !== '') return explicit
   const fromEnv = process.env.ESCAPE_CWD
   if (fromEnv && fromEnv.trim() !== '') return fromEnv
-  const current = process.cwd()
-  if (current === '/' || current === '') return homedir()
-  return current
+  return process.cwd()
 }
 
 export function createEscapeAgentClient(options: { command?: string; cwd?: string } = {}): AgentClient {

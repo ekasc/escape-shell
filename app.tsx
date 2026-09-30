@@ -2190,6 +2190,38 @@ function Switch({
   )
 }
 
+/** A compact labelled button, for a row whose control is an action. */
+function SettingsActionButton({
+  testId,
+  label,
+  onClick,
+}: {
+  testId: string
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <Button
+      testId={testId}
+      onClick={onClick}
+      style={{
+        display: 'flex',
+        flexDirection: 'row',
+        alignItems: 'center',
+        height: 24,
+        paddingLeft: 8,
+        paddingRight: 8,
+        borderRadius: 6,
+        cursor: 'pointer',
+        backgroundColor: C.item,
+        hover: { backgroundColor: C.overlay },
+      }}
+    >
+      <text style={{ fontSize: 12, color: C.secondary }}>{label}</text>
+    </Button>
+  )
+}
+
 function SettingsRow({
   label,
   description,
@@ -2420,6 +2452,9 @@ function SettingsScreen({
   gitDirty,
   onRefreshGit,
   onOpenDiff,
+  startDir,
+  onStartDir,
+  startDirError,
 }: {
   settings: SettingsState
   onChange: (patch: Partial<SettingsState>) => void
@@ -2444,11 +2479,15 @@ function SettingsScreen({
   gitDirty: number
   onRefreshGit: () => void
   onOpenDiff: () => void
+  startDir: string
+  onStartDir: (next: string) => void
+  startDirError: string
 }) {
   const [section, setSection] = useState<SettingsSectionId>('general')
   const [query, setQuery] = useState('')
   const [goKey, setGoKey] = useState('')
   const [zenKey, setZenKey] = useState('')
+  const [startDraft, setStartDraft] = useState(startDir)
   const [epUrl, setEpUrl] = useState('')
   const [epKey, setEpKey] = useState('')
   const activeLabel = SETTINGS_SECTIONS.find((s) => s.id === section)?.label ?? section
@@ -2643,6 +2682,72 @@ function SettingsScreen({
           </div>
           {section === 'general' && (
             <div style={{ display: 'flex', flexDirection: 'column' }}>
+              <SettingsGroupLabel>Startup</SettingsGroupLabel>
+              <SettingsCard>
+                {match('Starting directory', 'where a session opens') && (
+                  <SettingsRow
+                    label="Starting directory"
+                    description={
+                      startDir === ''
+                        ? 'A session opens in your home folder. Set a directory to open there instead.'
+                        : 'A session opens here when the app is launched.'
+                    }
+                    control={
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'row',
+                          alignItems: 'center',
+                          gap: 6,
+                          width: 300,
+                        }}
+                      >
+                        <input
+                          testId="settings-start-dir"
+                          value={startDraft}
+                          placeholder="Home folder"
+                          theme={currentTheme()}
+                          onChange={(event) => setStartDraft(event.value ?? '')}
+                          onSubmit={() => onStartDir(startDraft)}
+                          style={{
+                            flexGrow: 1,
+                            minWidth: 0,
+                            height: 28,
+                            fontSize: 12,
+                            color: C.text,
+                            backgroundColor: '#00000000',
+                            borderWidth: 0,
+                          }}
+                        />
+                        <SettingsActionButton
+                          testId="settings-start-dir-apply"
+                          label="Set"
+                          onClick={() => onStartDir(startDraft)}
+                        />
+                        {startDir !== '' && (
+                          <SettingsActionButton
+                            testId="settings-start-dir-clear"
+                            label="Clear"
+                            onClick={() => {
+                              setStartDraft('')
+                              onStartDir('')
+                            }}
+                          />
+                        )}
+                      </div>
+                    }
+                  />
+                )}
+                {startDirError !== '' && (
+                  <text
+                    testId="settings-start-dir-error"
+                    role="alert"
+                    style={{ fontSize: 12, color: C.error, paddingLeft: 16, paddingBottom: 12 }}
+                  >
+                    {startDirError}
+                  </text>
+                )}
+              </SettingsCard>
               <SettingsGroupLabel>Diffs</SettingsGroupLabel>
               <SettingsCard>
                 {match('Default diff file state', 'expanded or collapsed') && (
@@ -6090,6 +6195,8 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
 
   const [engineUp, setEngineUp] = useState(false)
   const [engineError, setEngineError] = useState('')
+  const [startDir, setStartDir] = useState('')
+  const [startDirError, setStartDirError] = useState('')
   // Why the last submit did nothing. Distinct from an engine error: nothing
   // broke, the prompt simply was not sendable, and saying so beats silence.
   const [submitNotice, setSubmitNotice] = useState('')
@@ -6301,6 +6408,7 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
       )
       setTextModelState(state.titleModel)
       setApiBaseURL(state.apiEndpointBaseURL)
+      setStartDir(state.defaultProject)
       setModels(modelList)
       setProviders(providerList)
       setCwd(state.cwd)
@@ -6654,6 +6762,23 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
       }
     } catch (e) {
       setSubmitNotice(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /**
+   * Sets the directory a session opens in. The engine owns the decision and
+   * switches to it, so the value on screen is the one in force rather than a
+   * value the app hopes will be read next time.
+   */
+  const saveStartDir = async (next: string) => {
+    setStartDirError('')
+    try {
+      const result = await client.setDefaultProject(next.trim())
+      setStartDir(result.defaultProject)
+      if (result.cwd) setCwd(result.cwd)
+      await refreshSessions()
+    } catch (e) {
+      setStartDirError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -7129,6 +7254,9 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
           onSaveKey={(id, key) => void saveProviderKey(id, key)}
           onRemoveKey={(id) => void removeProviderKey(id)}
           onSaveEndpoint={(baseURL, key) => void saveEndpoint(baseURL, key)}
+          startDir={startDir}
+          onStartDir={(next) => void saveStartDir(next)}
+          startDirError={startDirError}
           followUp={followUp}
           onFollowUp={(next) => void changeFollowUp(next)}
           textModel={textModel}
