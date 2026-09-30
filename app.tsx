@@ -761,10 +761,20 @@ function ConversationRow({
   conversation,
   active,
   onSelect,
+  scopeProject,
 }: {
   conversation: Conversation
   active: boolean
   onSelect: (id: string) => void
+  /**
+   * The project this list is already scoped to, when there is one.
+   *
+   * A row used to name its project under the title, which under a "Recent in
+   * aoi" heading meant the word "aoi" repeated once per row in the most-repeated
+   * position on screen. Set this and the line is dropped; leave it unset for
+   * lists that genuinely span projects, like the search overlay.
+   */
+  scopeProject?: string
 }) {
   return (
     <Button
@@ -796,20 +806,25 @@ function ConversationRow({
         {conversation.title}
       </text>
       <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 5 }}>
-        <Icon name="folder" size={12.5} color={C.tertiary} />
-        <text
-          style={{
-            fontSize: 13,
-            lineHeight: 15,
-            color: C.tertiary,
-            flexGrow: 1,
-            minWidth: 0,
-            whiteSpace: 'nowrap',
-            textOverflow: 'ellipsis',
-          }}
-        >
-          {conversation.project}
-        </text>
+        {scopeProject === undefined && (
+          <>
+            <Icon name="folder" size={12.5} color={C.tertiary} />
+            <text
+              style={{
+                fontSize: 13,
+                lineHeight: 15,
+                color: C.tertiary,
+                flexGrow: 1,
+                minWidth: 0,
+                whiteSpace: 'nowrap',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {conversation.project}
+            </text>
+          </>
+        )}
+        {scopeProject !== undefined && <div style={{ flexGrow: 1 }} />}
         <text style={{ fontSize: 12.5, color: C.muted, flexShrink: 0 }}>{conversation.time}</text>
       </div>
     </Button>
@@ -861,14 +876,27 @@ function ProjectRow({
         paddingRight: 8,
         borderRadius: 6,
         cursor: 'pointer',
-        backgroundColor: current ? C.overlay : '#00000000',
-        hover: { backgroundColor: current ? C.overlayStrong : C.item },
+        // The label above sits 8px in from the list's own 10px padding, so the
+        // row's 8px lined its text up with the label. With the fill gone there
+        // is no slab edge to align, and the text lining up with the section
+        // label above it is the alignment that actually reads.
+        // No fill for the current project. It was a filled slab spanning almost
+        // the whole sidebar to mark a three-letter name, and it was the only
+        // filled surface in the column, so it became the first thing your eye
+        // landed on in the entire window. A selection marker has to be quieter
+        // than the content it labels. The check and the weight say it, and the
+        // accessible name already says "current project", so the fill was
+        // carrying nothing that was not already carried twice.
+        hover: { backgroundColor: C.item },
       }}
     >
       <Icon name="folder" size={14} color={current ? C.text : C.secondary} />
       <text
         style={{
           fontSize: 13,
+          // Weight rather than a background, so the current project is legible
+          // in peripheral vision without competing with the transcript.
+          fontWeight: current ? 600 : 400,
           color: current ? C.text : C.secondary,
           flexGrow: 1,
           minWidth: 0,
@@ -959,6 +987,7 @@ function RecentSessions({
                   conversation={conversation}
                   active={false}
                   onSelect={onSelect}
+                  scopeProject={project}
                 />
               ))}
             </div>
@@ -1107,6 +1136,11 @@ function Sidebar({
           paddingRight: 10,
         }}
       >
+        {/* 12/muted, the same as every group label in the content. It was 13 at
+            weight 500, which made the sidebar's one section label louder than
+            every section label in the main area and nearly as loud as the window
+            title, so there was no way to tell navigation from content. Chrome
+            recedes; content leads. */}
         <div
           style={{
             display: 'flex',
@@ -1117,9 +1151,7 @@ function Sidebar({
             paddingRight: 8,
           }}
         >
-          <text style={{ fontSize: 13, fontWeight: 500, color: C.secondary, flexGrow: 1 }}>
-            Projects
-          </text>
+          <text style={{ fontSize: 12, color: C.muted, flexGrow: 1 }}>Projects</text>
         </div>
         {projects.length === 0 ? (
           <text
@@ -7070,6 +7102,10 @@ export function ChatApp({ client: providedClient }: { client?: AgentClient } = {
     try {
       const result = await client.switchProject(path)
       setCwd(result.cwd)
+      // The engine records the use and reorders the list, so the sidebar has to
+      // ask again. Keeping the first list meant the project you just switched
+      // to never moved, which is the one moment the order is meant to change.
+      setProjects((await client.listProjects()).projects)
       await refreshSessions()
     } catch (e) {
       setEngineError(e instanceof Error ? e.message : String(e))

@@ -2961,3 +2961,54 @@ describe('starting directory setting', () => {
     }
   })
 })
+
+describe('project list order', () => {
+  // The list was in the order projects were added, which buries the one you
+  // actually work in as the list grows. The engine sorts on last use; this
+  // holds the shell to reading that order rather than re-sorting or reversing.
+  it('lists projects in the order the engine gives them', async () => {
+    const fake = new FakeEngine()
+    // Deliberately not alphabetical and not insertion order.
+    fake.projects = [
+      { path: '/Users/tester/Projects/zeta' },
+      { path: '/Users/tester/Projects/alpha' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      const painted = renderer.getPaintedText().join(' ')
+      // zeta comes first because the engine said so, so the shell must not
+      // alphabetise it away.
+      expect(painted.indexOf('zeta')).toBeLessThan(painted.indexOf('alpha'))
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('refetches the list after a switch, so the order can change', async () => {
+    // The order is the engine's to decide, and it only changes when the engine
+    // records the use. If the shell kept its first list, the sidebar would not
+    // move even though the engine had reordered.
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/Projects/alpha' },
+      { path: '/Users/tester/Projects/beta' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      const before = fake.calls.filter((c) => c.method === 'listProjects').length
+      await app.getByTestId('sidebar-project-/Users/tester/Projects/beta').click()
+      await settle(renderer)
+      expect(
+        fake.calls.filter((c) => c.method === 'listProjects').length,
+      ).toBeGreaterThan(before)
+    } finally {
+      await app.close()
+    }
+  })
+})
