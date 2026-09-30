@@ -80,3 +80,17 @@ export function normaliseKey(raw: string | undefined): NormalKey {
       return 'other'
   }
 }
+
+/**
+ * True for the keys that activate a control: Enter and Space.
+ *
+ * Every activatable control answers to both, which is the platform convention
+ * and not a nicety — a button that only answers Enter is not keyboard-operable
+ * the way a screen reader user expects. This exists as one function because
+ * twenty controls had grown their own comparison, all of which tested for `" "`,
+ * and the platform sends `"space"`. Space activated nothing anywhere in the app.
+ */
+export function isActivate(raw: string | undefined): boolean {
+  const key = normaliseKey(raw)
+  return key === 'enter' || key === 'space'
+}

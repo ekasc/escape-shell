@@ -13,7 +13,7 @@
 import os from 'os'
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { C, type Palette } from './theme-tokens'
-import { normaliseKey } from './keys'
+import { isActivate, normaliseKey } from './keys'
 import { DURATION, fadeIn } from './motion'
 import { DesignRun, type DesignOutcome, type DesignPhase } from './design-run'
 import { createEscapeAgentClient, TRANSCRIPT_PAGE } from './agent-client'
@@ -72,7 +72,7 @@ function Button({
       tabIndex={disabled ? -1 : 0}
       onClick={disabled ? undefined : onClick}
       onKeyDown={(event: { key?: string }) => {
-        if (!disabled && onClick && (event.key === 'enter' || event.key === ' ')) onClick()
+        if (!disabled && onClick && (isActivate(event.key))) onClick()
       }}
       style={{ ...(style as object), cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.35 : (style as { opacity?: number } | undefined)?.opacity }}
       {...(rest as object)}
@@ -188,7 +188,7 @@ function DialogClose({
     <div testId={testId} role="button" aria-label="Close" tabIndex={0}
       onClick={close}
       onKeyDown={(event: { key?: string }) => {
-        if (event.key === 'enter' || event.key === ' ') close()
+        if (isActivate(event.key)) close()
       }}
       style={{ ...(style as object), cursor: 'pointer' }}>
       {children}
@@ -1266,7 +1266,7 @@ function WorkedFor({
         aria-label={duration}
         testId="work-fold-toggle"
         onClick={() => setOpen((value) => !value)}
-        onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') setOpen((value) => !value) }}
+        onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) setOpen((value) => !value) }}
         style={{
           display: 'flex',
           flexDirection: 'row',
@@ -1482,7 +1482,7 @@ function CopyButton({
       // hover. A glyph with no name is invisible to a screen reader.
       aria-label={failed ? `Copy ${label ?? ''} failed` : copied ? 'Copied' : `Copy ${label ?? ''}`}
       onClick={press}
-      onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') press() }}
+      onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) press() }}
       style={{
         display: 'flex', flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
         width: 22, height: 20, borderRadius: 5,
@@ -2205,7 +2205,7 @@ function Switch({
       tabIndex={0}
       onClick={() => onChange(!checked)}
       onKeyDown={(event: { key?: string }) => {
-        if (event.key === 'enter' || event.key === ' ') onChange(!checked)
+        if (isActivate(event.key)) onChange(!checked)
       }}
       style={{
         width: 40,
@@ -3690,7 +3690,7 @@ function Header({
           tabIndex={0}
           onClick={onToggleGit}
           onKeyDown={(e: { key?: string }) => {
-            if (e.key === 'enter' || e.key === ' ') onToggleGit()
+            if (isActivate(e.key)) onToggleGit()
           }}
           style={{
             display: 'flex',
@@ -4157,7 +4157,7 @@ function DesignToggle({
       tabIndex={0}
       onClick={onToggle}
       onKeyDown={(event: { key?: string }) => {
-        if (event.key === 'enter' || event.key === ' ') onToggle()
+        if (isActivate(event.key)) onToggle()
       }}
       style={{
         display: 'flex',
@@ -4760,7 +4760,7 @@ function Composer({
             tabIndex={0}
             onClick={() => (busy ? onStop() : send(value))}
             onKeyDown={(event: { key?: string }) => {
-              if (event.key === 'enter' || event.key === ' ') busy ? onStop() : send(value)
+              if (isActivate(event.key)) busy ? onStop() : send(value)
             }}
             style={{
               width: 26,
@@ -5307,7 +5307,7 @@ function DiffOverlay({
                   tabIndex={0}
                   onClick={() => onLayoutChange(option)}
                   onKeyDown={(event: { key?: string }) => {
-                    if (event.key === 'enter' || event.key === ' ') onLayoutChange(option)
+                    if (isActivate(event.key)) onLayoutChange(option)
                   }}
                   style={{
                     paddingLeft: 10,
@@ -5544,7 +5544,7 @@ function ChangesPanel({
           tabIndex={0}
           aria-expanded={open}
           onClick={() => toggle(key)}
-          onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') toggle(key) }}
+          onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) toggle(key) }}
           style={{
             display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6,
             height: 28, paddingLeft: 8, paddingRight: 8,
@@ -5561,7 +5561,7 @@ function ChangesPanel({
             tabIndex={0}
             aria-label={key === 'staged' ? `Unstage all ${label.toLowerCase()}` : `Stage all ${label.toLowerCase()}`}
             onClick={() => action()}
-            onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') action() }}
+            onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) action() }}
             style={{
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               height: 20, paddingLeft: 6, paddingRight: 6, borderRadius: 5,
@@ -5586,7 +5586,7 @@ function ChangesPanel({
             tabIndex={0}
             aria-pressed={isSelected}
             onClick={() => onSelectPath(isSelected ? null : f.path)}
-            onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') onSelectPath(isSelected ? null : f.path) }}
+            onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) onSelectPath(isSelected ? null : f.path) }}
             style={{
               display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6,
               height: 24, paddingLeft: 22, paddingRight: 8,
@@ -5604,7 +5604,7 @@ function ChangesPanel({
               tabIndex={0}
               aria-label={key === 'staged' ? `Unstage ${f.path}` : `Stage ${f.path}`}
               onClick={() => action([f.path])}
-              onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') action([f.path]) }}
+              onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) action([f.path]) }}
               style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 width: 18, height: 18, borderRadius: 4, cursor: 'pointer', hover: { backgroundColor: C.overlayStrong },
@@ -5679,7 +5679,7 @@ function ChangesPanel({
                   tabIndex={0}
                   aria-disabled={message.trim() === ''}
                   onClick={() => commit()}
-                  onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') commit() }}
+                  onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) commit() }}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 5, height: 24,
                     paddingLeft: 10, paddingRight: 10, borderRadius: 7,
@@ -5697,7 +5697,7 @@ function ChangesPanel({
                   tabIndex={0}
                   aria-label="Cancel commit"
                   onClick={() => { setShowCommitBox(false); setMessage('') }}
-                  onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') { setShowCommitBox(false); setMessage('') } }}
+                  onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) { setShowCommitBox(false); setMessage('') } }}
                   style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}
                 >
                   <text style={{ fontSize: 13, color: C.secondary }}>{'\u2715'}</text>
@@ -5713,7 +5713,7 @@ function ChangesPanel({
               role="button"
               tabIndex={0}
               onClick={() => setShowCommitBox(true)}
-              onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') setShowCommitBox(true) }}
+              onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) setShowCommitBox(true) }}
               style={{
                 display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6,
                 height: 24, paddingLeft: 8, paddingRight: 8, borderRadius: 7,
@@ -5867,8 +5867,8 @@ function GitSidebar({
           // GPUIX's key payload carries no modifier state, so there is no
           // shift-for-coarse-step; each press is a fixed 12px.
           const step = 12
-          if (e.key === 'arrowleft') { setWidth(w => Math.min(maxW, Math.max(280, w - step))); clearTextSelection() }
-          if (e.key === 'arrowright') { setWidth(w => Math.min(maxW, Math.max(280, w + step))); clearTextSelection() }
+          if (normaliseKey(e.key) === 'left') { setWidth(w => Math.min(maxW, Math.max(280, w - step))); clearTextSelection() }
+          if (normaliseKey(e.key) === 'right') { setWidth(w => Math.min(maxW, Math.max(280, w + step))); clearTextSelection() }
         }}
         onMouseDown={(e: { x?: number }) => {
           // Clear any selection the press already began, so the drag starts on
@@ -5957,8 +5957,8 @@ function GitSidebar({
             onMouseLeave={() => { splitDrag.current = null; setSplitting(false) }}
             onKeyDown={(e: { key?: string }) => {
               const step = 4
-              if (e.key === 'arrowup') { setListPct(p => Math.max(12, p - step)); clearTextSelection() }
-              if (e.key === 'arrowdown') { setListPct(p => Math.min(80, p + step)); clearTextSelection() }
+              if (normaliseKey(e.key) === 'up') { setListPct(p => Math.max(12, p - step)); clearTextSelection() }
+              if (normaliseKey(e.key) === 'down') { setListPct(p => Math.min(80, p + step)); clearTextSelection() }
             }}
             style={{
               // 12px tall rather than 8: the visible rule is 2px, but the hit
@@ -6057,7 +6057,7 @@ function GitSidebar({
                     tabIndex={0}
                     aria-label="Show all files"
                     onClick={() => setSelectedPath(null)}
-                    onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') setSelectedPath(null) }}
+                    onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) setSelectedPath(null) }}
                     style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 20, height: 20, borderRadius: 5, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}
                   >
                     <text style={{ fontSize: 13, color: C.secondary }}>{'×'}</text>
@@ -6195,7 +6195,7 @@ function TurnDiff({ patch, onOpenDiff }: { patch: string; onOpenDiff?: () => voi
                 role="button"
                 tabIndex={0}
                 onClick={() => toggleFolder(folder)}
-                onKeyDown={(e: { key?: string }) => { if (e.key === 'enter' || e.key === ' ') toggleFolder(folder) }}
+                onKeyDown={(e: { key?: string }) => { if (isActivate(e.key)) toggleFolder(folder) }}
                 style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, height: 26, paddingLeft: 8, paddingRight: 8, borderRadius: 7, cursor: 'pointer', hover: { backgroundColor: C.overlay } }}
               >
                 <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={10} color={C.tertiary} />

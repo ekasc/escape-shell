@@ -944,10 +944,20 @@ describeNative('engine chat', () => {
 
   it('resizes both handles from the keyboard', async () => {
     const fake = new FakeEngine()
+    // Enough files that the list is at its height cap. The list is
+    // content-sized up to the cap, so with one file the cap is not binding and
+    // raising it moves nothing — which is exactly how a test that cannot fail
+    // gets written.
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      path: `src/module-${i}.ts`,
+      insertions: i + 1,
+      deletions: 0,
+      untracked: false,
+    }))
     fake.vcs = {
       isRepo: true, refName: 'main', hasChanges: true,
-      staged: [], unstaged: [{ path: 'a.ts', insertions: 1, deletions: 0, untracked: false }],
-      insertions: 1, deletions: 0,
+      staged: [], unstaged: many,
+      insertions: many.length, deletions: 0,
     }
     const { render, renderer } = createTestRoot()
     render(<ChatApp client={fake} />)
@@ -965,12 +975,31 @@ describeNative('engine chat', () => {
       expect(width).toBeDefined()
       expect(split).toBeDefined()
       // Keyboard resize must be able to move the panel, not just the pointer.
-      await app.getByTestId('git-split-handle').press('arrowdown')
+      // This used to press the keys and then assert the sidebar still existed,
+      // which passes whether or not anything moved — and nothing did, because
+      // the handlers compared against "arrowdown" where the platform sends
+      // "down". So the geometry is asserted instead.
+      const geometry = () => {
+        const get = renderer as unknown as {
+          getElementBounds: (id: number) => { x: number; y: number; width: number; height: number }
+        }
+        return {
+          panel: get.getElementBounds(renderer.findByTestId('git-sidebar')!.id),
+          split: get.getElementBounds(renderer.findByTestId('git-split-handle')!.id),
+        }
+      }
+
+      const before = geometry()
+      // The platform's spelling, not the DOM's.
+      renderer.nativeSimulateKeyDown(renderer.findByTestId('git-split-handle')!.id, 'down')
       await settle(renderer)
-      await app.getByTestId('git-resize-handle').press('arrowright')
+      const afterSplit = geometry()
+      expect(afterSplit.split.y).toBeGreaterThan(before.split.y)
+
+      renderer.nativeSimulateKeyDown(renderer.findByTestId('git-resize-handle')!.id, 'right')
       await settle(renderer)
-      // Still alive after keyboard interaction.
-      expect(renderer.findByTestId('git-sidebar')).toBeDefined()
+      const afterWidth = geometry()
+      expect(afterWidth.panel.width).toBeGreaterThan(before.panel.width)
     } finally {
       await app.close()
     }
@@ -3068,6 +3097,56 @@ describe('sidebar footer placement', () => {
       const list = bounds(renderer, 'sidebar-projects')
       expect(footer.y + footer.height).toBe(size.height)
       expect(list.footer.y + list.footer.height).toBeLessThanOrEqual(footer.y)
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+describe('keyboard activation', () => {
+  // Every activatable control answers to Enter and Space, which is the platform
+  // convention. Twenty of them compared against the DOM's " " and the platform
+  // sends "space", so Space activated nothing anywhere in the app while every
+  // test passed, because the assertions never pressed it.
+  it('activates a control with Space, using the platform\'s spelling', async () => {
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/Projects/alpha' },
+      { path: '/Users/tester/Projects/beta' },
+    ]
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      const row = renderer.findByTestId('sidebar-project-/Users/tester/Projects/beta')!
+      renderer.nativeSimulateKeyDown(row.id, 'space')
+      await settle(renderer)
+      expect(
+        fake.calls.find((c) => c.method === 'switchProject')?.args?.[0],
+      ).toBe('/Users/tester/Projects/beta')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('still activates with Enter, so the fix did not trade one key for another', async () => {
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/Projects/alpha' },
+      { path: '/Users/tester/Projects/beta' },
+    ]
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      const row = renderer.findByTestId('sidebar-project-/Users/tester/Projects/beta')!
+      renderer.nativeSimulateKeyDown(row.id, 'enter')
+      await settle(renderer)
+      expect(
+        fake.calls.find((c) => c.method === 'switchProject')?.args?.[0],
+      ).toBe('/Users/tester/Projects/beta')
     } finally {
       await app.close()
     }
