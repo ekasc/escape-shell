@@ -42,9 +42,20 @@ function requireBuilt(): void {
   }
 }
 
+// The launcher moves into a real working directory before exec'ing.
+//
+// macOS starts a Finder-launched app in "/", and that directory is inherited by
+// everything the app spawns. The client also falls back to the home directory
+// when it sees that, so the engine gets the right project either way, but the
+// app process itself was still sitting in the filesystem root, and anything
+// that reached for the working directory would find it there.
+//
+// ESCAPE_CWD wins, so the override keeps working; HOME is the fallback because
+// it is the one directory a person is always willing to be in.
 const LAUNCHER = `#!/bin/sh
 # Escape desktop launcher: runs the bundled UI on the bundled Bun runtime.
 DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "\${ESCAPE_CWD:-$HOME}" || cd "$HOME"
 exec "$DIR/{{BIN}}/bun" "$DIR/{{APP}}/shell.js" "$@"
 `
 
