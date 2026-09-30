@@ -4,15 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --hot app.tsx",
+    "dev": "bun run build:engine && ESCAPE_BIN=$PWD/build/engine/escape bun --hot app.tsx",
     "build": "bun run build:engine && bun run build:shell",
     "build:engine": "mkdir -p build/engine && cd ../engine && go build -trimpath -o ../shell/build/engine/escape .",
     "build:shell": "mkdir -p build/app && bun build app.tsx --target=bun --minify --external '@gpuix/native' --external '@gpuix/native-*' --outfile build/app/shell.js",
     "bundle": "bun run build && bun scripts/assemble.ts",
     "app": "bun run build && bun scripts/assemble.ts --app",
-    "run": "bun run bundle && ESCAPE_BIN=$PWD/build/release/escape ./build/release/escape-shell",
+    "run": "bun run dev",
+    "run:packaged": "bun run bundle && ./build/release/escape-shell",
     "install:app": "bash scripts/install.sh",
-    "verify": "bun run bundle && ESCAPE_BIN=$PWD/build/release/escape bun test ./agent-client.integration.ts",
+    "verify": "bun run bundle && ESCAPE_BIN=$PWD/build/release/bin/escape bun test ./agent-client.integration.ts",
     "web:dev": "bun web.ts",
     "screenshot": "bun screenshot.ts",
     "test": "vitest run",
@@ -20,11 +21,16 @@
     "typecheck": "tsc --noEmit",
     "fixtures": "bun scripts/fixtures.ts",
     "fixtures:fix": "bun scripts/fixtures.ts --write",
-    "clean": "rm -rf build"
+    "clean": "rm -rf build",
+    "palette": "bun run palette-check.ts",
+    "bench:harness": "bunx vitest run -c vitest.bench.config.ts",
+    "bench:engine": "bun scripts/bench-rpc.ts"
   },
   "dependencies": {
     "@gpuix/react": "^0.10.0",
-    "react": "^19.3.0"
+    "@types/mdast": "4.0.4",
+    "react": "^19.3.0",
+    "safe-mdx": "1.14.0"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

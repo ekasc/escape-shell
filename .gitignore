@@ -7,3 +7,6 @@ screenshots/
 
 # pi's own state for this directory (not part of the repo)
 .pi/
+
+# Scratch copies of files being edited. They are not source and they drift.
+.escape-backup/

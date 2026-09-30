@@ -35,11 +35,23 @@ bun run dev
 
 The desktop app opens at 940 × 660. A save remounts the React tree in the same window.
 
-Set `ESCAPE_BIN` when the engine binary is not on `PATH`:
+`dev` is the default way to run the shell and it is always hot. It builds the Go
+engine first — a no-op build is about 0.6s, since Go's cache absorbs it — and
+points `ESCAPE_BIN` at `build/engine/escape` before launching. Both steps matter:
+`resolveEngineCommand` looks for the engine next to `Bun.main` and then falls back
+to a bare `escape` on `PATH`, and from `shell/app.tsx` none of those candidates
+exist, so without `ESCAPE_BIN` the engine silently fails to spawn.
+
+`bun run run` is an alias for `bun run dev`, so both words give you a hot shell.
+
+To launch the assembled, packaged build instead — the one that ships:
 
 ```bash
-ESCAPE_BIN=/path/to/escape bun run dev
+bun run run:packaged
 ```
+
+Set `ESCAPE_BIN` yourself only when running `bun --hot app.tsx` directly against
+an engine that is not `build/engine/escape`.
 
 ## Packaging
 
@@ -94,7 +106,8 @@ Other scripts:
 | `bun run build:shell` | Bundle the GPUIX UI into `build/app/shell.js` (native binding external) |
 | `bun run bundle` | Build both binaries and assemble a single installable release directory |
 | `bun run app` | Assemble a macOS `.app` with the engine in `Contents/Resources/bin` |
-| `bun run run` | Build the flat bundle and launch it against the bundled engine |
+| `bun run run` | Alias for `dev` — the hot shell |
+| `bun run run:packaged` | Build the flat bundle and launch the assembled, non-hot build |
 | `bun run verify` | Prove the bundled engine is resolvable and speaks RPC |
 | `bun run install:app` | Build and install `Escape.app` into `~/Applications` |
 | `bun run clean` | Remove `build/` |
@@ -154,7 +167,8 @@ runtime enabled for notarization.
 
 | Script | What it does |
 |---|---|
-| `bun run dev` | Start the desktop app with hot reload |
+| `bun run dev` | Start the desktop app with hot reload (default) |
+| `bun run run` | Same as `dev`; both give you a hot shell |
 | `bun run build` | Build both binaries into `build/` |
 | `bun run bundle` | Build both binaries and assemble a single installable release directory |
 | `bun run test` | Drive the app through the GPU test renderer with Vitest |

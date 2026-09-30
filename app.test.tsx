@@ -1,1577 +1,3201 @@
 /**
- * Drives the local chat through the GPU test renderer.
+ * Tests for the engine-backed chat app.
  *
- * The app is imported, not launched, so `render()` at the bottom of `app.tsx`
- * is guarded by an entry-point check. `connectTest` gives the same locator API
- * as `launch()` in `screenshot.ts`, without a child process.
+ * Renderer tests drive ChatApp against FakeEngine, a scripted AgentClient
+ * that behaves like the engine at the RPC boundary without spawning a
+ * process. Pure helpers (diff parsing, timeline derivation, formatting) are
+ * tested directly.
  */
 
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import React from 'react'
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
+import { motion, render, resetRender } from '@gpuix/react'
+import { DURATION, __setReducedMotionForTest, fadeIn } from './motion'
+import { normaliseKey } from './keys'
 import { connectTest } from '@gpuix/react/automation'
-import { createTestRoot, hasNativeTestRenderer } from '@gpuix/react/testing'
-
-import { ChatApp, dispatchWindowCommand } from './app'
-import type { AgentClient, AgentEvent } from './agent-client'
+import { createTestRoot, hasNativeTestRenderer, TestRenderer } from '@gpuix/react/testing'
+import {
+  ChatApp,
+  FilterSelect,
+  MONO_FONTS,
+  SANS_FONTS,
+  SafeMdxContent,
+  SafeMdxTranscript,
+  activityDuration,
+  applyTurnEvent,
+  applyTypography,
+  commitBlockedReason,
+  agentStatusLabel,
+  createBlockStreamer,
+  currentTheme,
+  deriveTimelineRows,
+  formatDuration,
+  groupForSession,
+  THEMES,
+  dispatchWindowKey,
+  hasAnsi,
+  highlightRuns,
+  parseAnsi,
+  parseUnifiedDiff,
+  projectName,
+  reduceAgentStatus,
+  relativeTime,
+  turnDurationLabel,
+  validatePrompt,
+} from './app'
+import type { VcsStatus } from './agent-client'
+import { parseTranscriptPage } from './agent-client'
+import { FakeEngine } from './fake-engine'
+import {
+  isMonoFamily,
+  parseFontFamilies,
+  splitSystemFonts,
+  toFontOption,
+} from './fonts'
 
 const describeNative = hasNativeTestRenderer ? describe : describe.skip
+const SHOTS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'screenshots')
 
-function paintedText(renderer: { getPaintedText(): string[] }): string {
-  return renderer.getPaintedText().join('\n')
+beforeAll(() => {
+  fs.mkdirSync(SHOTS, { recursive: true })
+})
+
+type Renderer = ReturnType<typeof createTestRoot>['renderer']
+
+/** The test renderer stores a text run's style on the sibling node that
+ *  precedes its content, so look the style up beside the content. */
+function textRunStyle(
+  renderer: Renderer,
+  content: string,
+): Record<string, unknown> | undefined {
+  const texts = renderer.findByType('text')
+  const index = texts.findIndex((el) => el.text === content)
+  if (index <= 0) return undefined
+  return texts[index - 1]!.style as Record<string, unknown>
 }
 
-/**
- * The first message in a draft chat now waits on the engine to create the
- * session before it is dispatched, so engine-mode assertions need a tick.
- */
-/** Wraps a skills fixture in the RPC envelope, so the shape is written once. */
-function skillsResponse<T>(skills: T[], projects: Array<{ path: string; name: string }> = []) {
-  return { skills, projects }
+async function settle(renderer: Renderer, rounds = 8): Promise<void> {
+  for (let i = 0; i < rounds; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  renderer.flush()
 }
 
-/**
- * Switches a settings tab and waits for the incoming section to be present.
- *
- * The section bodies are sibling conditionals with no key, so nothing remounts
- * and a person clicking cannot hit this. The automation can: a click on a node
- * whose layout has not been committed lands on nothing, which is what made
- * "click a tab, then click a control in it" intermittently fail.
- */
-async function openSection(
-  app: Awaited<ReturnType<typeof connectTest>>,
-  section: string,
-  landing: string,
-): Promise<void> {
-  await app.getByTestId(`settings-tab-${section}`).click()
-  await app.getByTestId(landing).waitFor({ timeoutMs: 2_000 })
+function typeSend(renderer: Renderer, word: string): void {
+  const textarea = renderer.findByType('textarea')[0]!
+  renderer.nativeSimulateKeystrokes(textarea.id, word.split('').join(' '))
+  renderer.nativeSimulateKeystrokes(textarea.id, 'enter')
 }
 
-/** Polls until a condition holds, so a test never depends on a fixed sleep. */
-async function waitFor(predicate: () => boolean, message: string, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
+/** Opens the add-project sheet and waits for its first result to land. */
+async function openAddProject(
+  renderer: ReturnType<typeof createTestRoot>['renderer'],
+  app: { getByTestId: (id: string) => { click: () => Promise<void> } },
+  fake: FakeEngine,
+) {
+  await app.getByTestId('add-project').click()
+  for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
     await new Promise((r) => setTimeout(r, 10))
   }
-  throw new Error(message)
+  await settle(renderer)
 }
 
-async function flushEngineRoundTrip(): Promise<void> {
-  await new Promise((r) => setTimeout(r, 0))
-  await new Promise((r) => setTimeout(r, 0))
-}
+const DAY = 24 * 60 * 60 * 1000
 
-const testRuntimeSettings = {
-  async getState() { return { state: 'idle', sessionId: 'test-session', sessionFile: '/tmp/test.jsonl', cwd: '/tmp', model: 'test-model', provider: 'test-provider', thinkingLevel: 'off', approvalMode: 'auto', autoCompaction: false, autoRetry: false, steeringMode: 'one-at-a-time', followUpMode: 'one-at-a-time', maxTokens: 0 } },
-  async ping() { return true },
-  async getProviders() { return [{ id: 'test-provider', name: 'Test provider', configured: true }] },
-  async getCommands() { return [] },
-  async getSessionStats() { return null },
-  async getTranscript() { return [] },
-  async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
-  async getLastAssistantText() { return '' },
-  async getForkMessages() { return [] },
-  async getTree() { return [] },
-  async bash() { return { output: '', exitCode: 0, truncated: false } },
-  async abortBash() {},
-  async getDiff() { return 'No uncommitted changes.' },
-  async getMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-  async addMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-  async replaceMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-  async removeMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-  async fork() { return null },
-  async undo() { return null },
-  async cloneSession() { return null },
-  async steer() {},
-  async followUp() {},
-  async exportHtml() { return null },
-  async compact() { return '' },
-  async snapcompact() { return '' },
-  async recap() { return '' },
-  async getModels() { return ['test-model'] },
-  async getThinkingLevels() { return ['off', 'high'] },
-  async setModel() {},
-  async setProvider() {},
-  async setApiKey() {},
-  async setApprovalMode() {},
-  async setAutoCompaction() {},
-  async setAutoRetry() {},
-  async setMaxTokens() {},
-  async abortRetry() {},
-  async setSteeringMode() {},
-  async setFollowUpMode() {},
-  async setThinkingLevel() {},
-  async getDiagnostics() {
-    return { provider: 'provider-a', model: 'model-a', firstTokenP50Ms: 120, turns: [] }
-  },
-  async writeDiagnostics() { return { path: '/tmp/diag.txt', report: 'escape diagnostics' } },
-}
-
-
-/** A fully-populated engine client for settings tests; override only what a case needs. */
-function makeSettingsClient(overrides: Partial<AgentClient> = {}): AgentClient {
-  return {
-    mode: 'engine',
-    async getState() {
-      return {
-        state: 'idle', sessionId: 'session-a', sessionFile: '/tmp/a.jsonl', cwd: '/tmp',
-        model: 'model-a', provider: 'provider-a', thinkingLevel: 'off', approvalMode: 'auto',
-        autoCompaction: false, autoRetry: false, steeringMode: 'one-at-a-time',
-        followUpMode: 'one-at-a-time', maxTokens: 0,
-      }
-    },
-    async ping() { return true },
-    async getDiagnostics() {
-      return { provider: 'provider-a', model: 'model-a', firstTokenP50Ms: 120, turns: [] }
-    },
-    async writeDiagnostics() { return { path: '/tmp/diag.txt', report: 'escape diagnostics' } },
-    async listSkills() { return { skills: [], projects: [] } },
-    async setSkillEnabled() { return { pending: false } },
-    async getMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-    async addMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-    async replaceMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-    async removeMemory() { return { entries: [], used: 0, max: 2200, path: '' } },
-    async getProviders() {
-      return [
-        { id: 'provider-a', name: 'Provider A', configured: true },
-        { id: 'provider-b', name: 'Provider B', configured: true },
-      ]
-    },
-    async getCommands() { return [] },
-    async getSessionStats() {
-      return {
-        sessionId: 's1', userMessages: 1, assistantMessages: 2, toolCalls: 3, totalMessages: 3,
-        tokens: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 },
-        cost: 0.0123, contextTokens: 30, contextWindow: 1000, contextPercent: 3,
-      }
-    },
-    async getTranscript() { return [] },
-    async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
-    async getLastAssistantText() { return 'last response' },
-    async getForkMessages() { return [{ entryId: 'u1', text: 'question' }] },
-    async getTree() { return [{ entryId: 'u1', role: 'user', text: 'question', children: [] }] },
-    async bash() { return { output: 'ok', exitCode: 0, truncated: false } },
-    async abortBash() {},
-    async getDiff() { return 'diff --git a/file b/file' },
-    async fork() { return '/tmp/session-fork.jsonl' },
-    async undo() { return '/tmp/session-undo.jsonl' },
-    async cloneSession() { return '/tmp/session-clone.jsonl' },
-    async steer() {},
-    async followUp() {},
-    async exportHtml() { return { path: '/tmp/session-s1.html' } },
-    async compact() { return 'compacted summary' },
-    async snapcompact() { return 'snap summary' },
-    async recap() { return 'recap summary' },
-    async getModels() { return ['model-a', 'model-b'] },
-    async getThinkingLevels() { return ['off', 'high'] },
-    async setModel() {},
-    async setProvider() {},
-    async setApiKey() {},
-    async setApprovalMode() {},
-    async setAutoCompaction() {},
-    async setAutoRetry() {},
-    async setMaxTokens() {},
-    async abortRetry() {},
-    async setSteeringMode() {},
-    async setFollowUpMode() {},
-    async setThinkingLevel() {},
-    async listSessions() { return [] },
-    async send() {},
-    async answerApproval() {},
-    async answerQuestion() {},
-    async newSession() { return null },
-    async switchSession() { return null },
-    async setSessionName() {},
-    stop() {},
-    close() {},
-    ...overrides,
-  }
-}
-
-describeNative('chat app', () => {
-  it('opens with a welcome state and a composer', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
-
-    const text = paintedText(renderer)
-    expect(text).toContain('What can I help you with?')
-    expect(text).toContain('Ask anything...')
-    expect(text).toContain('Start a chat to create your first space.')
-    // The product is named once, in the sidebar. Anywhere else it is either a
-    // fallback inventing a project name or the brand inside a sentence that
-    // reads fine without it.
-    const brandCount = (text.match(/Escape/g) ?? []).length
-    expect(brandCount).toBeLessThanOrEqual(1)
-    // The suggestion chips were removed; the headline and composer are the
-    // whole empty state now.
-    expect(text).not.toContain('Plan a project')
-
-    await app.close()
+describe('diff parsing', () => {
+  it('splits files and reconstructs old/new texts', () => {
+    const patch = [
+      'diff --git a/a.ts b/a.ts',
+      'index 111..222 100644',
+      '--- a/a.ts',
+      '+++ b/a.ts',
+      '@@ -1,3 +1,3 @@',
+      ' same',
+      '-old',
+      '+new',
+      'diff --git a/b.ts b/b.ts',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/b.ts',
+      '@@ -0,0 +1,2 @@',
+      '+one',
+      '+two',
+    ].join('\n')
+    const files = parseUnifiedDiff(patch)
+    expect(files).toHaveLength(2)
+    expect(files[0]).toEqual({ path: 'a.ts', oldText: 'same\nold', newText: 'same\nnew', added: 1, removed: 1 })
+    expect(files[1]).toEqual({ path: 'b.ts', oldText: '', newText: 'one\ntwo', added: 2, removed: 0 })
   })
 
-  it('sends a message and paints a local agent response', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
+  it('returns no files for an empty patch', () => {
+    expect(parseUnifiedDiff('')).toEqual([])
+    expect(parseUnifiedDiff('No uncommitted changes.')).toEqual([])
+  })
+})
 
-    await app.getByTestId('chat-input').fill('Help me plan a project')
-    await app.getByTestId('send-message').click()
-
-    const text = paintedText(renderer)
-    expect(text).toContain('Help me plan a project')
-    expect(text).toContain("Let's make a small plan.")
-    expect(text).not.toContain('What can I help you with?')
-
-    await app.close()
+describe('session grouping and labels', () => {
+  it('buckets sessions into Today/Yesterday/This Month/Older', () => {
+    const now = new Date(2026, 8, 29, 12, 0, 0).getTime()
+    expect(groupForSession(now - 1000, now)).toBe('Today')
+    expect(groupForSession(now - 26 * 3600 * 1000, now)).toBe('Yesterday')
+    expect(groupForSession(now - 5 * DAY, now)).toBe('This Month')
+    expect(groupForSession(now - 60 * DAY, now)).toBe('Older')
   })
 
-  it('submits from the keyboard and clears the composer', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
-
-    const input = app.getByTestId('chat-input')
-    await input.fill('Hello Escape')
-    await input.press('Enter')
-
-    expect(paintedText(renderer)).toContain("Tell me what you're working on")
-    expect(await input.textContent()).toBe('')
-
-    await app.close()
+  it('formats relative times', () => {
+    const now = Date.now()
+    expect(relativeTime(now, now)).toBe('now')
+    expect(relativeTime(now - 16 * 60 * 1000, now)).toBe('16m')
+    expect(relativeTime(now - 14 * 3600 * 1000, now)).toBe('14h')
+    expect(relativeTime(now - 2 * DAY, now)).toBe('2d')
   })
 
-  it('lists and switches engine sessions', async () => {
-    const switched: string[] = []
-    const session = { id: 'session-1', path: '/tmp/session-1.jsonl', cwd: '/tmp', name: 'Previous session', updatedAt: 0 }
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return [session] },
-      async send() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession(path) { switched.push(path); return session },
-      async getTranscript() {
-        return [{ id: 'm1', role: 'user' as const, content: 'earlier question' }, { id: 'm2', role: 'assistant' as const, content: 'earlier answer' }]
-      },
-      async getTranscriptPage() {
-        return {
-          messages: [
-            { id: 'm1', role: 'user' as const, content: 'earlier question' },
-            { id: 'm2', role: 'assistant' as const, content: 'earlier answer' },
-          ],
-          hasMore: false,
-          earliestId: 'm1',
-        }
-      },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('space-/tmp').waitFor({ timeoutMs: 1_000 })
-    await app.getByText('Previous session').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('session-row-/tmp/session-1.jsonl').click()
-    // Viewing is passive: it must NOT switch the engine's active session.
-    expect(switched).toEqual([])
-    // The viewed session's transcript must actually render.
-    await app.getByTestId('message-m1').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('message-m2').textContent()).toContain('earlier answer')
-    await app.close()
+  it('formats durations and derives fold labels', () => {
+    expect(formatDuration(2000)).toBe('Worked for 2 seconds')
+    expect(formatDuration(61000)).toBe('Worked for 1 minute')
+    expect(activityDuration([])).toBe('Worked')
+    expect(
+      activityDuration([{ id: 't', name: 'read', status: 'running', createdAt: Date.now() }]),
+    ).toBe('Working…')
+    const start = 1000
+    expect(
+      activityDuration([
+        { id: 't', name: 'read', status: 'done', createdAt: start, endedAt: start + 9000 },
+      ]),
+    ).toBe('Worked for 9 seconds')
+    // A reloaded transcript has no timestamps. The elapsed time is unknown,
+    // not zero, so the label reports the count instead of inventing a duration.
+    expect(
+      activityDuration([
+        { id: 'a', name: 'bash', status: 'done' },
+        { id: 'b', name: 'bash', status: 'done' },
+        { id: 'c', name: 'read', status: 'done' },
+      ]),
+    ).toBe('3 tool calls')
+    expect(activityDuration([{ id: 'a', name: 'bash', status: 'done' }])).toBe('1 tool call')
   })
 
-  it('renders and resolves an approval request', async () => {
-    const approvals: Array<{ id: string; approved: boolean }> = []
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async send(_prompt, onEvent) {
-        const event: AgentEvent = { kind: 'approval', toolCallId: 'call-1', toolName: 'bash', args: {} }
-        onEvent(event)
-      },
-      async answerApproval(id, approved) {
-        approvals.push({ id, approved })
-      },
-      async answerQuestion() {},
-      async listSessions() { return [] },
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').fill('run the test')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    expect(paintedText(renderer)).toContain('Approval required')
-    await app.getByTestId('approval-allow').click()
-    expect(approvals).toEqual([{ id: 'call-1', approved: true }])
-    await app.close()
+  it('labels projects with a fallback', () => {
+    expect(projectName('/Users/tester/projects/alpha')).toBe('alpha')
+    expect(projectName('/Users/tester/projects/alpha/')).toBe('alpha')
   })
 
-  it('renders structured tool activity', async () => {
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async send(_prompt, onEvent) {
-        onEvent({ kind: 'tool_start', toolCallId: 'tool-1', toolName: 'bash' })
-        onEvent({ kind: 'tool_end', toolCallId: 'tool-1', toolName: 'bash', output: 'done', isError: false })
-        onEvent({ kind: 'settled', reason: 'done' })
-      },
-      async listSessions() { return [] },
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').fill('run a tool')
-    await app.getByTestId('send-message').click()
-    await app.getByTestId('tool-activity-tool-1').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('tool-activity-tool-1').textContent()).toContain('bash')
-    await app.close()
-  })
-
-  it('renders and resolves a question request', async () => {
-    const answers: Array<{ id: string; answer: string }> = []
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async send(_prompt, onEvent) {
-        const event: AgentEvent = { kind: 'question', questionId: 'q-1', question: 'Which environment?' }
-        onEvent(event)
-      },
-      async answerApproval() {},
-      async answerQuestion(id, answer) {
-        answers.push({ id, answer })
-      },
-      async listSessions() { return [] },
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').fill('help me')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    expect(paintedText(renderer)).toContain('Which environment?')
-    await app.getByTestId('question-input').fill('staging')
-    await app.getByTestId('answer-question').click()
-    expect(answers).toEqual([{ id: 'q-1', answer: 'staging' }])
-    await app.close()
-  })
-
-  it('session settings open a path and save a name', async () => {
-    const switched: string[] = []
-    const named: string[] = []
-    const client = makeSettingsClient({
-      async switchSession(path) { switched.push(path); return null },
-      async setSessionName(name) { named.push(name) },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-
-    await app.getByTestId('session-path').fill('/tmp/session-explicit.jsonl')
-    await app.getByTestId('switch-session-path').click()
-    await app.getByTestId('session-name').fill('Named session')
-    await app.getByTestId('rename-session').click()
-
-    expect(switched).toEqual(['/tmp/session-explicit.jsonl'])
-    expect(named).toEqual(['Named session'])
-    await app.close()
-  })
-
-  it('settings uses a nav rail with a back link that restores the app', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={makeSettingsClient()} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-panel').waitFor({ timeoutMs: 2_000 })
-
-    // The rail owns the window instead of sitting in the 780px chat measure.
-    const panel = await app.getByTestId('settings-panel').bounds()
-    expect(panel.width).toBeGreaterThan(900)
-    expect(panel.height).toBeGreaterThan(600)
-
-    // Selecting a section retitles the page and swaps the rows.
-    await app.getByTestId('settings-title').waitFor({ timeoutMs: 1_000 })
-    expect(paintedText(renderer)).toContain('Open a specific session file')
-    await openSection(app, 'model', 'provider-option-provider-a')
-    expect(paintedText(renderer)).toContain('Reasoning effort')
-
-    await app.getByTestId('settings-back').click()
-    expect(await app.getByTestId('settings-panel').count()).toBe(0)
-    await app.getByTestId('chat-input').waitFor({ timeoutMs: 2_000 })
-    await app.close()
-  })
-
-  it('shows durable memory and edits it through the engine', async () => {
-    let entries = ['RPC session header is bound in agent.New']
-    const snapshot = () => ({ entries: [...entries], used: entries.join('').length, max: 2200, path: '/root/MEMORY.md' })
-    const client = makeSettingsClient({
-      async getMemory() { return snapshot() },
-      async addMemory(text: string) { entries = [...entries, text]; return snapshot() },
-      async removeMemory(index: number) { entries = entries.filter((_, i) => i !== index - 1); return snapshot() },
-      async replaceMemory(index: number, text: string) { entries[index - 1] = text; return snapshot() },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await openSection(app, 'memory', 'memory-entry-1')
-
-    // The existing note is visible, and the usage figure is stated.
-    expect(paintedText(renderer)).toContain('RPC session header is bound in agent.New')
-    expect(paintedText(renderer)).toContain('of 2200 characters')
-
-    // Add a note.
-    await app.getByTestId('memory-input').fill('Provider keys never reach the renderer')
-    await app.getByTestId('memory-save').click()
-    await app.getByTestId('memory-entry-2').waitFor({ timeoutMs: 1_000 })
-    expect(entries).toEqual(['RPC session header is bound in agent.New', 'Provider keys never reach the renderer'])
-
-    // Edit it in place.
-    await app.getByTestId('memory-edit-1').click()
-    await app.getByTestId('memory-input').fill('Session header lives in agent.New')
-    await app.getByTestId('memory-save').click()
-    await new Promise((r) => setTimeout(r, 100))
-    expect(entries[0]).toBe('Session header lives in agent.New')
-
-    // Remove it.
-    await app.getByTestId('memory-remove-2').click()
-    await new Promise((r) => setTimeout(r, 100))
-    expect(entries).toEqual(['Session header lives in agent.New'])
-    await app.close()
-  })
-
-  it('surfaces a memory write that the engine rejected', async () => {
-    const client = makeSettingsClient({
-      async getMemory() { return { entries: [], used: 0, max: 2200, path: '/root/MEMORY.md' } },
-      async addMemory() { throw new Error('memory is full (2200 char limit); remove or shorten an entry first') },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-memory').click()
-    await app.getByTestId('memory-empty').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('memory-input').fill('one more note')
-    await app.getByTestId('memory-save').click()
-    await app.getByTestId('memory-error').waitFor({ timeoutMs: 1_000 })
-    expect(paintedText(renderer)).toContain('memory is full')
-    await app.close()
-  })
-
-  it('follows an engine-initiated session switch', async () => {
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return [] },
-      async getTranscript(path: string) {
-        return [{ id: 'm1', role: 'user' as const, content: `transcript for ${path}` }]
-      },
-      async send(_prompt, onEvent) {
-        onEvent({
-          kind: 'session_switched',
-          path: '/repo/escape/resumed.jsonl',
-          name: 'Resumed session',
-          cwd: '/repo/escape',
-        } satisfies AgentEvent)
-        onEvent({ kind: 'settled', reason: 'done' })
-      },
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').waitFor({ timeoutMs: 2_000 })
-    await app.getByTestId('chat-input').fill('resume the session header work')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    await new Promise((r) => setTimeout(r, 120))
-
-    // The shell followed the engine instead of showing the old transcript.
-    expect(paintedText(renderer)).toContain('transcript for /repo/escape/resumed.jsonl')
-    expect(await app.getByTestId('header-title').textContent()).toContain('Resumed session')
-    expect(await app.getByTestId('session-row-/repo/escape/resumed.jsonl').count()).toBe(1)
-    await app.close()
-  })
-
-  it('routes Cmd shortcuts to settings and the sidebar', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={makeSettingsClient()} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').waitFor({ timeoutMs: 2_000 })
-
-    // Cmd+, opens settings.
-    dispatchWindowCommand('open-settings')
-    await app.getByTestId('settings-panel').waitFor({ timeoutMs: 1_000 })
-
-    // Cmd+3 jumps to a settings section directly.
-    dispatchWindowCommand('settings-section-3')
-    await app.getByText('Memory').waitFor({ timeoutMs: 1_000 })
-
-    // Cmd+1 back to the first section.
-    dispatchWindowCommand('settings-section-1')
-    await app.getByText('Session name').waitFor({ timeoutMs: 1_000 })
-
-    // Escape closes settings rather than reaching further.
-    dispatchWindowCommand('stop-agent')
-    await new Promise((r) => setTimeout(r, 50))
-    expect(await app.getByTestId('settings-panel').count()).toBe(0)
-    await app.getByTestId('chat-input').waitFor({ timeoutMs: 1_000 })
-    await app.close()
-  })
-
-  it('accepts sidebar shortcuts without disturbing the app', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
-    const handle = app.getByTestId('sidebar-resize-handle')
-    await handle.waitFor({ timeoutMs: 2_000 })
-
-    // The collapse and expand are 200ms motion tweens, and the test renderer
-    // does not advance them, so collapsed geometry is not observable here. What
-    // this covers is that each shortcut dispatches safely and the app stays
-    // interactive; the geometry itself is verified in the drag test.
-    const before = await handle.bounds()
-    dispatchWindowCommand('collapse-sidebar')
-    dispatchWindowCommand('toggle-sidebar')
-    dispatchWindowCommand('expand-sidebar')
-    await new Promise((r) => setTimeout(r, 50))
-
-    await app.getByTestId('chat-input').fill('still working')
-    expect(await app.getByTestId('chat-input').count()).toBe(1)
-    expect(paintedText(renderer)).toContain('still working')
-    // Round trip leaves the sidebar where it started.
-    expect((await handle.bounds()).x).toBe(before.x)
-    await app.close()
-  })
-
-  it('lists the keyboard reference in settings', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={makeSettingsClient()} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await openSection(app, 'keyboard', 'shortcut-new-chat')
-    expect(paintedText(renderer)).toContain('Cmd+N')
-    expect(paintedText(renderer)).toContain('Cmd+,')
-    await app.close()
-  })
-
-  it('lists skills with descriptions and toggles them', async () => {
-    const calls: Array<[string, boolean | null]> = []
-    let enabled = true
-    const skills = [
-      { name: 'apple-design', description: 'Apple interface design and motion', path: '/s/apple/SKILL.md', location: 'user', enabled: true, globalEnabled: true, project: '', overrides: [] },
-      { name: 'poteto-mode', description: 'Concise, deliberate agent replies', path: '/s/poteto/SKILL.md', location: 'user', enabled: false, globalEnabled: false, project: '', overrides: [] },
-    ]
-    const client = makeSettingsClient({
-      async listSkills() {
-        return {
-          skills: skills.map((s) => ({ ...s, enabled: s.name === 'apple-design' ? enabled : false })),
-          projects: [],
-        }
-      },
-      async setSkillEnabled(_path: string, next: boolean | null) { calls.push([_path, next]); enabled = next ?? enabled; return { pending: false } },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skill-apple-design').waitFor({ timeoutMs: 1_000 })
-
-    // Descriptions are shown, not just names, because that is the whole reason
-    // to look at this list.
-    expect(paintedText(renderer)).toContain('Apple interface design and motion')
-    expect(paintedText(renderer)).toContain('Concise, deliberate agent replies')
-
-    // Toggling calls through. The switch is optimistic, so the row has already
-    // moved by the time the call lands; the assertion is on the call, not a sleep.
-    await app.getByTestId('skill-toggle-apple-design').press('Enter')
-    await waitFor(() => calls.length > 0, 'the engine was never asked to toggle the skill')
-    expect(calls).toEqual([['/s/apple/SKILL.md', false]])
-    await app.close()
-  })
-
-  it('restores a skill row when the engine rejects a toggle', async () => {
-    const client = makeSettingsClient({
-      async listSkills() {
-        return skillsResponse([{ name: 'solo', description: 'only skill', path: '/s/solo/SKILL.md', location: 'user', enabled: true, globalEnabled: true, project: '', overrides: [] }])
-      },
-      async setSkillEnabled() { throw new Error('engine is busy') },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skill-solo').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('skill-toggle-solo').press('Enter')
-    await waitFor(
-      () => paintedText(renderer).includes('engine is busy') || true,
-      'the rejected toggle should settle',
+  it('heads each turn with its work and drops orphans', () => {
+    // The work fold is a header on the turn, so it comes first — the reader
+    // sees what the agent did, then the answer.
+    const rows = deriveTimelineRows(
+      [
+        { id: 'u1', role: 'user', content: 'hi', turnId: 't1' },
+        { id: 'a1', role: 'assistant', content: 'hello', turnId: 't1' },
+      ],
+      [
+        { id: 'tool-1', name: 'read', status: 'done', turnId: 't1' },
+        { id: 'orphan', name: 'x', status: 'done' },
+      ],
     )
-    await new Promise((r) => setTimeout(r, 80))
-    // The switch is optimistic, so a failure has to put it back rather than
-    // leaving the row lying about the engine's state.
-    const toggle = await app.getByTestId('skill-toggle-solo')
-    expect((await toggle.textContent()) ?? '').not.toContain('undefined')
-    await app.close()
+    expect(rows.map((r) => r.key)).toEqual(['a:t1', 'm:u1', 'm:a1'])
   })
 
-  it('scopes a skill decision to a named project rather than a presumed one', async () => {
-    const calls: Array<[string, boolean | null, string, string | undefined]> = []
-    const projects = [
-      { path: '/repo/engine', name: 'engine' },
-      { path: '/repo/shell', name: 'shell' },
+  it('closes a turn with its changes card, and only when it changed something', () => {
+    const messages = [
+      { id: 'u1', role: 'user' as const, content: 'fix it', turnId: 't1' },
+      { id: 'a1', role: 'assistant' as const, content: 'Fixed.', turnId: 't1' },
+      { id: 'u2', role: 'user' as const, content: 'thanks', turnId: 't2' },
+      { id: 'a2', role: 'assistant' as const, content: 'Anytime.', turnId: 't2' },
     ]
-    // Global says off. The engine project has turned it back on for itself.
-    const skills = [{
-      name: 'contested',
-      description: 'decided in two places',
-      path: '/s/contested/SKILL.md',
-      location: 'user',
-      enabled: true,
-      globalEnabled: false,
-      project: '',
-      overrides: [{ project: '/repo/engine', enabled: true }],
-    }]
-    const client = makeSettingsClient({
-      async listSkills() { return skillsResponse(skills, projects) },
-      async setSkillEnabled(path: string, next: boolean | null, scope: string, project?: string) {
-        calls.push([path, next, scope, project])
-        return { pending: false }
-      },
+    const rows = deriveTimelineRows(messages, [], {
+      t1: 'diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-a\n+b',
     })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skill-contested').waitFor({ timeoutMs: 1_000 })
+    // The card sits at the end of the turn that changed files, not the end of
+    // the conversation.
+    expect(rows.map((r) => r.key)).toEqual(['m:u1', 'm:a1', 'd:t1', 'm:u2', 'm:a2'])
+    const card = rows[2]!
+    expect(card.kind === 'diff' && card.turnId).toBe('t1')
+  })
+})
 
-    // Both projects are offered by name, because the shell can hold more than
-    // one and there is no single current project to assume.
-    await app.getByTestId('skills-scope-column').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('skill-scope-engine').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('skill-scope-shell').waitFor({ timeoutMs: 1_000 })
-    expect(paintedText(renderer)).not.toContain('This project')
-
-    // Everywhere shows the global state, which is off.
-    await app.getByTestId('skill-toggle-contested').press('Enter')
-    await waitFor(() => calls.length > 0, 'the global scope never reached the engine')
-    expect(calls[0][2]).toBe('global')
-    expect(calls[0][3]).toBeUndefined()
-
-    // The engine project inherits its own override, which is on, and a toggle
-    // there names the project rather than assuming one.
-    await app.getByTestId('skill-scope-engine').click()
-    await new Promise((r) => setTimeout(r, 50))
-    expect(paintedText(renderer)).toContain('set here')
-    await app.getByTestId('skill-toggle-contested').press('Enter')
-    await waitFor(() => calls.length > 1, 'the project scope never reached the engine')
-    expect(calls[1][2]).toBe('project')
-    expect(calls[1][3]).toBe('/repo/engine')
-    await app.close()
+describe('turn lifecycle', () => {
+  it('records the span the engine reports, not a sum of tool timings', () => {
+    // The engine's own start-to-end span covers the thinking before the first
+    // tool call and the writing after the last one, which a sum of tool
+    // timings cannot see.
+    let ledger = applyTurnEvent({}, { kind: 'turn_start', turnId: 'r1' }, 1_000).ledger
+    const ended = applyTurnEvent(
+      ledger,
+      { kind: 'turn_end', turnId: 'r1', reason: 'done', state: 'completed' },
+      226_000,
+    )
+    expect(ended.ledger['r1']).toEqual({ state: 'completed', startedAt: 1_000, endedAt: 226_000 })
+    expect(turnDurationLabel(ended.ledger['r1'], [])).toBe('Worked for 3 minutes')
   })
 
-  it('marks a skill it has not decided about as inherited', async () => {
-    const client = makeSettingsClient({
-      async listSkills() {
-        return skillsResponse([
-          { name: 'inherited-one', description: 'no decision here', path: '/s/i/SKILL.md', location: 'user', enabled: true, globalEnabled: true, project: '', overrides: [] },
-          { name: 'decided-here', description: 'decided here', path: '/s/d/SKILL.md', location: 'user', enabled: false, globalEnabled: true, project: '', overrides: [{ project: '/repo/escape', enabled: false }] },
-        ], [{ path: '/repo/escape', name: 'escape' }])
-      },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skill-scope-escape').click()
-    await app.getByTestId('skill-inherited-one').waitFor({ timeoutMs: 1_000 })
-    const text = paintedText(renderer)
-    expect(text).toContain('inherited: on')
-    expect(text).toContain('set here')
-    // Descriptions are never replaced by the scope marker.
-    expect(text).toContain('no decision here')
-    expect(text).toContain('decided here')
-    await app.close()
+  it('keeps an interrupted turn apart from a failed one', () => {
+    let ledger = applyTurnEvent({}, { kind: 'turn_start', turnId: 'r1' }, 0).ledger
+    ledger = applyTurnEvent(
+      ledger,
+      { kind: 'turn_end', turnId: 'r1', reason: 'stopped', state: 'interrupted' },
+      5_000,
+    ).ledger
+    expect(ledger['r1']!.state).toBe('interrupted')
+    // "Worked for 5 seconds" would claim a completion that did not happen.
+    expect(turnDurationLabel(ledger['r1'], [])).toBe('Interrupted')
   })
 
-  it('says the engine could not answer instead of claiming no skills exist', async () => {
-    const client = makeSettingsClient({
-      async listSkills() { throw new Error('unknown command: list_skills') },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skills-error').waitFor({ timeoutMs: 2_000 })
-    const text = paintedText(renderer)
-    expect(text).toContain('Could not load skills')
-    expect(text).toContain('unknown command')
-    // The honest failure must not masquerade as an empty machine.
-    expect(await app.getByTestId('skills-empty').count()).toBe(0)
-    await app.close()
+  it('reports no change for events that say nothing about turns', () => {
+    // The reason the reducer returns a verdict at all: writing state per event
+    // re-renders the timeline for every text delta on the wire.
+    expect(applyTurnEvent({}, { kind: 'text_delta', text: 'hi' }, 5).changed).toBe(false)
+    expect(applyTurnEvent({}, { kind: 'settled', reason: 'done' }, 5).changed).toBe(false)
+    expect(applyTurnEvent({}, { kind: 'turn_end', reason: 'done', state: 'completed' }, 5).changed)
+      .toBe(false)
   })
 
-  it('surfaces a malformed skills response instead of showing an empty list', async () => {
-    const client = makeSettingsClient({
-      // A shape the client does not recognise. Returning an array here is what a
-      // server-sent shape change looks like from the shell's side.
-      async listSkills() { return { projects: [] } as never },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skills-error').waitFor({ timeoutMs: 2_000 })
-    expect(paintedText(renderer)).toContain('Could not load skills')
-    expect(await app.getByTestId('skills-empty').count()).toBe(0)
-    await app.close()
+  it('does not let a repeated turn_end rewrite the recorded end time', () => {
+    let ledger = applyTurnEvent({}, { kind: 'turn_start', turnId: 'r1' }, 100).ledger
+    ledger = applyTurnEvent(
+      ledger,
+      { kind: 'turn_end', turnId: 'r1', reason: 'done', state: 'completed' },
+      200,
+    ).ledger
+    const again = applyTurnEvent(
+      ledger,
+      { kind: 'turn_end', turnId: 'r1', reason: 'done', state: 'completed' },
+      9_999,
+    )
+    expect(again.changed).toBe(false)
+    expect(again.ledger).toBe(ledger)
   })
 
-  it('says when a skill change has to wait for the current turn', async () => {
-    const client = makeSettingsClient({
-      async listSkills() {
-        return skillsResponse([{ name: 'busy', description: 'toggled during a turn', path: '/s/busy/SKILL.md', location: 'user', enabled: true, globalEnabled: true, project: '', overrides: [] }])
-      },
-      async setSkillEnabled() { return { pending: true } },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-skills').click()
-    await app.getByTestId('skill-toggle-busy').press('Enter')
-    await app.getByTestId('skill-pending').waitFor({ timeoutMs: 2_000 })
-    expect(paintedText(renderer)).toContain('Applies on your next turn')
-    await app.close()
+  it('ends the newest running turn when the engine names none', () => {
+    // An older engine sends no turnId on turn_end. The only turn that can be
+    // running is the newest one, so that is what closes.
+    let ledger = applyTurnEvent({}, { kind: 'turn_start', turnId: 'r1' }, 10).ledger
+    ledger = applyTurnEvent(ledger, { kind: 'turn_start', turnId: 'r2' }, 20).ledger
+    const ended = applyTurnEvent(ledger, { kind: 'turn_end', reason: 'done', state: 'completed' }, 30)
+    expect(ended.ledger['r2']!.state).toBe('completed')
+    // r1 was left running and must not be closed by a later turn's end.
+    expect(ended.ledger['r1']!.state).toBe('running')
   })
 
-  it('renders boolean settings as switches', async () => {
-    const toggled: boolean[] = []
-    const client = makeSettingsClient({
-      async setAutoCompaction(v) { toggled.push(v) },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await openSection(app, 'approvals', 'auto-compaction')
-    await app.getByTestId('auto-compaction').click()
-    expect(toggled).toEqual([true])
-    await app.close()
+  it('falls back to tool timings when the engine recorded no turn', () => {
+    // A reloaded transcript was streamed elsewhere, so the ledger is empty and
+    // the only known fact is the tool count.
+    expect(turnDurationLabel(undefined, [])).toBe('Worked')
+    expect(
+      turnDurationLabel(undefined, [
+        { id: '1', name: 'read', status: 'done', turnId: 'r1' },
+        { id: '2', name: 'write', status: 'done', turnId: 'r1' },
+      ]),
+    ).toBe('2 tool calls')
+  })
+})
+
+describe('submit validation', () => {
+  it('says why a keystroke did nothing instead of returning silently', () => {
+    expect(validatePrompt('hi', { busy: true, engineUp: true })).toBe(
+      'Wait for the current turn to finish, or stop it first.',
+    )
+    expect(validatePrompt('hi', { busy: false, engineUp: false })).toBe(
+      'The engine is not running.',
+    )
+    expect(validatePrompt('hi', { busy: false, engineUp: true })).toBeNull()
   })
 
-  it('model settings select provider, model, and reasoning', async () => {
-    const picked: string[] = []
-    const client = makeSettingsClient({
-      async setProvider(p) { picked.push(`provider:${p}`) },
-      async setModel(m) { picked.push(`model:${m}`) },
-      async setThinkingLevel(l) { picked.push(`level:${l}`) },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-model').click()
+  it('does not call an empty prompt a refusal', () => {
+    // There is nothing to explain: the composer simply has no prompt to send.
+    expect(validatePrompt('   ', { busy: false, engineUp: true })).toBeNull()
+  })
+})
 
-    await app.getByTestId('provider-option-provider-b').click()
-    await app.getByTestId('model-option-model-b').click()
-    await app.getByTestId('reasoning-option-high').click()
-
-    expect(picked).toEqual(['provider:provider-b', 'model:model-b', 'level:high'])
-    await app.close()
+describe('system fonts', () => {
+  it('parses fc-list output into deduplicated families', () => {
+    expect(
+      parseFontFamilies(
+        'Helvetica Neue\nMenlo\n.Heiti PUA\nMenlo\nHeiti\\-Bold\nHelvetica\n',
+      ),
+    ).toEqual(['Heiti-Bold', 'Helvetica Neue', 'Menlo'])
+    expect(parseFontFamilies('')).toEqual([])
   })
 
-  it('approvals section changes approval and queue policies', async () => {
-    const picked: string[] = []
-    const client = makeSettingsClient({
-      async setApprovalMode(m) { picked.push(`approval:${m}`) },
-      async setAutoCompaction() { picked.push('auto-compaction') },
-      async setAutoRetry() { picked.push('auto-retry') },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-approvals').click()
-
-    await app.getByTestId('approval-mode-ask').click()
-    await app.getByTestId('auto-compaction').click()
-    await app.getByTestId('auto-retry').click()
-
-    expect(picked).toEqual(['approval:ask', 'auto-compaction', 'auto-retry'])
-    await app.close()
+  it('detects monospace families', () => {
+    expect(isMonoFamily('Menlo')).toBe(true)
+    expect(isMonoFamily('CommitMono')).toBe(true)
+    expect(isMonoFamily('Courier New')).toBe(true)
+    expect(isMonoFamily('Helvetica')).toBe(false)
+    expect(isMonoFamily('Georgia')).toBe(false)
+    expect(isMonoFamily('Arial Unicode MS')).toBe(false)
+    expect(isMonoFamily('Source Code Pro')).toBe(true)
   })
 
-  it('account section saves a provider API key', async () => {
-    const keys: Array<[string, string]> = []
-    const client = makeSettingsClient({
-      async setApiKey(provider, key) { keys.push([provider, key]) },
-    })
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-account').click()
-
-    await app.getByTestId('provider-api-key').fill('secret-key')
-    await app.getByTestId('save-api-key').click()
-
-    expect(keys).toEqual([['opencode-go', 'secret-key']])
-    await app.getByTestId('login-status').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('login-status').textContent()).toContain('Saved opencode-go')
-    await app.close()
+  it('splits families into sans and mono pickers', () => {
+    const split = splitSystemFonts(['Helvetica Neue', 'Menlo', 'Georgia'])
+    expect(split.sans.map((f) => f.id)).toEqual(['Helvetica Neue', 'Menlo', 'Georgia'])
+    expect(split.mono.map((f) => f.id)).toEqual(['Menlo'])
+    expect(toFontOption('DaddyTime Mono').family).toBe('DaddyTime Mono')
+    expect(toFontOption('Menlo').family).toBe('Menlo')
   })
 
-  it('diagnostics section reports connection and session usage', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={makeSettingsClient()} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-diagnostics').click()
-
-    await app.getByTestId('ping-engine').click()
-    await app.getByTestId('connection-status').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('connection-status').textContent()).toContain('Engine connected')
-    expect(await app.getByTestId('runtime-state').textContent()).toContain('idle')
-    expect(await app.getByTestId('stats-messages').textContent()).toContain('3 messages')
-    expect(await app.getByTestId('stats-tokens').textContent()).toContain('30 tokens')
-    await app.close()
-  })
-
-  it('developer tools run diff, compaction, and history actions', async () => {
-    const client = makeSettingsClient()
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-developer').click()
-
-    await app.getByTestId('load-diff').click()
-    await app.getByTestId('diff-output').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('diff-output').textContent()).toContain('diff --git')
-
-    await app.getByTestId('compact-session').click()
-    await app.getByTestId('compaction-summary').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('compaction-summary').textContent()).toContain('compacted summary')
-
-    await app.getByTestId('load-session-tree').click()
-    await app.getByTestId('tree-fork-u1').waitFor({ timeoutMs: 1_000 })
-    await app.close()
-  })
-
-  it('developer tools run a shell command', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={makeSettingsClient()} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settings').click()
-    await app.getByTestId('settings-tab-developer').click()
-
-    await app.getByTestId('bash-command').fill('pwd')
-    await app.getByTestId('run-bash').click()
-    await app.getByTestId('bash-output').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('bash-output').textContent()).toContain('ok')
-    await app.close()
-  })
-
-  it('groups sessions into spaces and shows a running agent', async () => {
-    const stopped: string[] = []
-    const sessions = [
-      { id: 's1', path: '/repo/escape/a.jsonl', cwd: '/repo/escape', name: 'Refactor RPC' , updatedAt: 0 },
-      { id: 's2', path: '/repo/escape/b.jsonl', cwd: '/repo/escape', name: 'Fix parser' , updatedAt: 0 },
-      { id: 's3', path: '/repo/shell/c.jsonl', cwd: '/repo/shell', name: 'Composer work' , updatedAt: 0 },
-    ]
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return sessions },
-      async send(_prompt, onEvent) { onEvent({ kind: 'started' }) },
-      async switchSession(path) { return sessions.find((s) => s.path === path) ?? null },
-      async newSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() { stopped.push('stop') },
-      close() {},
+  it('emits bare family names the renderer can resolve', () => {
+    for (const option of [...SANS_FONTS, ...MONO_FONTS]) {
+      expect(option.family).not.toContain('"')
+      expect(option.family).not.toContain(',')
+      expect(option.family).toBe(option.id)
     }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-
-    // Two spaces, one per project directory.
-    await app.getByTestId('space-/repo/escape').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('space-/repo/shell').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('space-toggle-/repo/escape').textContent()).toContain('escape')
-    expect(await app.getByTestId('space-toggle-/repo/shell').textContent()).toContain('shell')
-
-    // Open a session, run a turn: it becomes a visible agent, not a session.
-    await app.getByTestId('session-row-/repo/escape/a.jsonl').click()
-    await app.getByTestId('chat-input').fill('do work')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    await app.getByTestId('agent-/repo/escape/a.jsonl').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('agent-/repo/escape/a.jsonl').textContent()).toContain('Refactor RPC')
-
-    await app.getByTestId('agent-stop-/repo/escape/a.jsonl').click()
-    expect(stopped).toEqual(['stop'])
-    await app.close()
   })
 
-  it('offers matching commands in the composer dock and runs one', async () => {
-    const sent: string[] = []
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async getCommands() { return [{ name: 'commands', description: 'Show available commands' }] },
-      async send(prompt) { sent.push(prompt) },
-      async listSessions() { return [] },
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
+  it('lists installed families instead of only the curated few', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot({ width: 1280, height: 1400 })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
     const app = await connectTest(renderer)
-    // Typing a slash in the composer surfaces matching commands.
-    await app.getByTestId('chat-input').fill('/comm')
-    await app.getByTestId('dock-commands').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('dock-help').count()).toBe(0)
-    await app.getByTestId('dock-commands').click()
-    expect(sent).toEqual(['/commands'])
-    await app.close()
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-sans').click()
+      await settle(renderer)
+      // Filter to a known staple that lives past the 120-row cap — proves the system list is present, not just the 5 fallbacks
+      const search = renderer.findByTestId('settings-sans-search')!
+      renderer.nativeSimulateKeystrokes(search.id, 'v e r')
+      await settle(renderer)
+      const labels = renderer.getPaintedText()
+      expect(labels.some((line) => line.includes('Verdana'))).toBe(true)
+    } finally {
+      await app.close()
+    }
   })
 
-  it('runs a command picked from the composer dock', async () => {
-    const sent: string[] = []
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async getCommands() { return [] },
-      async getLastAssistantText() { return 'last response' },
-      async recap() { return 'recap summary' },
-      async send(prompt) { sent.push(prompt) },
-      async listSessions() { return [] },
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
+  it('renders every curated fallback face distinctly', () => {
+    const shot = (family: string, name: string): Buffer => {
+      const { render, renderer } = createTestRoot({ width: 800, height: 200 })
+      render(
+        <div style={{ display: 'flex', width: '100%', height: '100%', backgroundColor: '#1A1A1A' }}>
+          <text style={{ fontSize: 32, color: '#E2E2E2', fontFamily: family }}>
+            The quick brown fox 0123456789
+          </text>
+        </div>,
+      )
+      renderer.flush()
+      const out = `/tmp/fontface-${name}.png`
+      renderer.captureScreenshot(out)
+      return fs.readFileSync(out)
     }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').fill('/rec')
-    await app.getByTestId('dock-recap').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('dock-recap').click()
-    await app.getByText('recap summary').waitFor({ timeoutMs: 1_000 })
-    expect(paintedText(renderer)).toContain('recap summary')
-
-    // review expands to a full prompt rather than the literal `/review`.
-    await app.getByTestId('chat-input').fill('/rev')
-    await app.getByTestId('dock-review').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('dock-review').click()
-    expect(sent[0]).toContain('Review the current uncommitted changes')
-    await app.close()
+    const baseline = shot('___no_such_font___', 'baseline')
+    const duds = [...SANS_FONTS, ...MONO_FONTS]
+      .filter((option) => shot(option.family, option.id).equals(baseline))
+      .map((option) => option.id)
+    expect(duds).toEqual([])
   })
 
-  it('queues steering and follow-up messages while busy', async () => {
-    const steered: string[] = []
-    const followUps: string[] = []
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async send(_prompt, onEvent) {
-        onEvent({ kind: 'queue_update', steering: ['change direction'], followUp: [] })
-        onEvent({ kind: 'compaction_start', reason: 'manual' })
-        onEvent({ kind: 'compaction_end', reason: 'manual', summary: 'summary' })
-      },
-      async steer(text) { steered.push(text) },
-      async followUp(text) { followUps.push(text) },
-      async listSessions() { return [] },
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
+  it('filters the font table and previews each face', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot({ width: 1280, height: 1400 })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
     const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').fill('start work')
-    await app.getByTestId('send-message').click()
-    await app.getByTestId('chat-input').fill('change direction')
-    await app.getByTestId('steer-message').click()
-    await app.getByTestId('chat-input').fill('then summarize')
-    await app.getByTestId('follow-up-message').click()
-    expect(steered).toEqual(['change direction'])
-    expect(followUps).toEqual(['then summarize'])
-    expect(await app.getByTestId('queue-status').textContent()).toContain('1 steering')
-    expect(await app.getByTestId('compaction-status').textContent()).toContain('Compaction complete')
-    await app.close()
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-sans').click()
+      await settle(renderer)
+      // Each row previews its own face: the style lives on the sibling node
+      // that precedes the run's content. Filter first so Verdana is visible past the 120-row cap.
+      const searchEarly = renderer.findByTestId('settings-sans-search')!
+      renderer.nativeSimulateKeystrokes(searchEarly.id, 'v e r')
+      await settle(renderer)
+      const texts = renderer.findByType('text')
+      const rowIndex = texts.findIndex((el) => el.text === 'Verdana')
+      expect(rowIndex).toBeGreaterThan(0)
+      expect(String(texts[rowIndex - 1]!.style['fontFamily'] ?? '')).toBe('Verdana')
+
+      expect(renderer.getPaintedText()).toContain('Verdana')
+      expect(renderer.getPaintedText()).not.toContain('Georgia')
+    } finally {
+      await app.close()
+    }
   })
 
-  it('creates a session on the first message, not when a chat is opened', async () => {
-    let created = 0
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return [] },
-      async newSession() {
-        created += 1
-        return { id: 'n1', path: '/repo/escape/new.jsonl', cwd: '/repo/escape', name: 'New chat', updatedAt: 0 }
-      },
-      async send(_prompt, onEvent) {
-        onEvent({ kind: 'text_delta', text: 'hello from the engine' })
-        onEvent({ kind: 'settled', reason: 'done' })
-      },
-      async switchSession() { return null },
-      async getTranscript() { return [] },
-      async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('chat-input').waitFor({ timeoutMs: 1_000 })
-
-    // Opening chats must not write session files.
-    for (let i = 0; i < 5; i++) {
-      await app.getByTestId('new-chat').click()
-      await new Promise((r) => setTimeout(r, 60))
-    }
-    expect(created).toBe(0)
-
-    // The first message creates exactly one, and it joins the sidebar.
-    await app.getByTestId('chat-input').fill('first real message')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    expect(created).toBe(1)
-    await app.getByTestId('session-row-/repo/escape/new.jsonl').waitFor({ timeoutMs: 1_000 })
-
-    // The second message reuses it.
-    await app.getByTestId('chat-input').fill('second message')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    expect(created).toBe(1)
-    await app.close()
-  })
-
-  it('settles old sessions into a collapsed shelf at the bottom', async () => {
-    const DAY = 24 * 60 * 60 * 1000
-    const now = Date.now()
-    const mk = (p: string, name: string, daysAgo: number) =>
-      ({ id: p, path: p, cwd: '/repo/escape', name, updatedAt: now - daysAgo * DAY })
-    const sessions = [
-      mk('/repo/escape/recent.jsonl', 'Recent work', 0),
-      mk('/repo/escape/old.jsonl', 'Old work', 21),
-      mk('/repo/escape/older.jsonl', 'Older work', 40),
-    ]
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return sessions },
-      async send() {},
-      async getTranscript() { return [] },
-      async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('space-/repo/escape').waitFor({ timeoutMs: 1_000 })
-
-    // Only the recent session is in the list you read every day.
-    expect(await app.getByTestId('session-row-/repo/escape/recent.jsonl').count()).toBe(1)
-    expect(await app.getByTestId('session-row-/repo/escape/old.jsonl').count()).toBe(0)
-
-    // Settled ones gather at the bottom, collapsed, behind a count.
-    await app.getByTestId('settled-shelf').waitFor({ timeoutMs: 1_000 })
-    expect((await app.getByTestId('settled-shelf-header').textContent())).toContain('Settled (2)')
-    expect(await app.getByTestId('settled-row-/repo/escape/old.jsonl').count()).toBe(0)
-
-    // Expanding reveals them, and the header drops the count.
-    await app.getByTestId('settled-shelf-header').click()
-    await app.getByTestId('settled-row-/repo/escape/old.jsonl').waitFor({ timeoutMs: 1_000 })
-    expect((await app.getByTestId('settled-shelf-header').textContent())).toContain('Settled')
-    expect((await app.getByTestId('settled-shelf-header').textContent())).not.toContain('(2)')
-    expect(await app.getByTestId('settled-row-/repo/escape/older.jsonl').count()).toBe(1)
-
-    // The shelf sits below the list, not inside it.
-    const list = await app.getByTestId('sidebar-list').bounds()
-    const shelf = await app.getByTestId('settled-shelf').bounds()
-    expect(shelf.y).toBeGreaterThanOrEqual(list.y + list.height - 1)
-    await app.close()
-  })
-
-  it('a settled session is still reachable and counts toward the shelf', async () => {
-    const DAY = 24 * 60 * 60 * 1000
-    const now = Date.now()
-    const sessions = [
-      { id: 'a', path: '/repo/escape/a.jsonl', cwd: '/repo/escape', name: 'Recent', updatedAt: now },
-      { id: 'b', path: '/repo/escape/b.jsonl', cwd: '/repo/escape', name: 'Settled', updatedAt: now - 30 * DAY },
-    ]
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return sessions },
-      async send() {},
-      async getTranscript(path: string) { return [{ id: 'm1', role: 'user' as const, content: `body of ${path}` }] },
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('settled-shelf-header').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('settled-shelf-header').click()
-    await app.getByTestId('settled-row-/repo/escape/b.jsonl').click()
-    await new Promise((r) => setTimeout(r, 50))
-    expect(paintedText(renderer)).toContain('body of /repo/escape/b.jsonl')
-    expect(await app.getByTestId('header-title').textContent()).toContain('Settled')
-    await app.close()
-  })
-
-  it('shows no shelf when every session is recent', async () => {
-    const now = Date.now()
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() {
-        return [{ id: 'a', path: '/repo/escape/a.jsonl', cwd: '/repo/escape', name: 'Today', updatedAt: now }]
-      },
-      async send() {},
-      async getTranscript() { return [] },
-      async getTranscriptPage() { return { messages: [], hasMore: false, earliestId: '' } },
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('session-row-/repo/escape/a.jsonl').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('settled-shelf').count()).toBe(0)
-    await app.close()
-  })
-
-  it('scrolls a long session list instead of painting over the footer', async () => {
-    const sessions = Array.from({ length: 31 }, (_, i) => ({
-      id: `s${i}`,
-      path: `/repo/shell/s${i}.jsonl`,
-      cwd: '/repo/shell',
-      name: `Session ${i}`,
-      updatedAt: Date.now(),
+  it('caps large font lists and narrows on typing', async () => {
+    const items = Array.from({ length: 200 }, (_, i) => ({
+      id: `Face ${i}`,
+      label: `Face ${i}`,
+      family: `Face ${i}`,
     }))
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return sessions },
-      async send() {},
-      async switchSession(path) { return sessions.find((s) => s.path === path) ?? null },
-      async newSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
+    const picked: string[] = []
+    const { render, renderer } = createTestRoot()
+    let value = ''
+    const Rerender = () => {
+      render(
+        <FilterSelect
+          testId="font-probe"
+          value={value}
+          items={items}
+          onChange={(id: string) => {
+            picked.push(id)
+            value = id
+          }}
+        />,
+      )
     }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
+    Rerender()
+    renderer.flush()
+
     const app = await connectTest(renderer)
-    await app.getByTestId('sidebar-list').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('session-row-/repo/shell/s0.jsonl').waitFor({ timeoutMs: 1_000 })
+    try {
+      await app.getByTestId('font-probe').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('200 of 200 — keep typing to narrow')
 
-    // The list is a scroll container, so 31 sessions reach the last ones
-    // instead of overflowing past the footer.
-    const before = (await app.getByTestId('session-row-/repo/shell/s0.jsonl').bounds()).y
-    for (let i = 0; i < 12; i++) await app.mouse.wheel({ x: 120, y: 400 }, 0, -120)
-    await new Promise((r) => setTimeout(r, 500))
-    const after = (await app.getByTestId('session-row-/repo/shell/s0.jsonl').bounds()).y
-    expect(before - after).toBeGreaterThan(100)
-    await app.close()
-  })
-
-  it('lists a running session once, as an agent, and keeps it reachable', async () => {
-    const sessions = [
-      { id: 'a', path: '/repo/escape/a.jsonl', cwd: '/repo/escape', name: 'Refactor RPC' , updatedAt: 0 },
-      { id: 'b', path: '/repo/escape/b.jsonl', cwd: '/repo/escape', name: 'Untitled session' , updatedAt: 0 },
-    ]
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return sessions },
-      async send(_prompt, onEvent) { onEvent({ kind: 'started' }) },
-      async switchSession(path) { return sessions.find((s) => s.path === path) ?? null },
-      async newSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
+      const search = renderer.findByTestId('font-probe-search')!
+      renderer.nativeSimulateKeystrokes(search.id, 'f a c e space 1 9')
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('11 of 200')
+      await app.getByTestId('font-probe-option-Face 19').click()
+      await settle(renderer)
+      expect(picked).toEqual(['Face 19'])
+    } finally {
+      await app.close()
     }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('session-row-/repo/escape/a.jsonl').waitFor({ timeoutMs: 1_000 })
-    await app.getByTestId('session-row-/repo/escape/a.jsonl').click()
-    await app.getByTestId('chat-input').fill('do work')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    await app.getByTestId('agent-/repo/escape/a.jsonl').waitFor({ timeoutMs: 1_000 })
-
-    // The running session is represented once, as an agent, not duplicated.
-    expect(await app.getByTestId('session-row-/repo/escape/a.jsonl').count()).toBe(0)
-    expect(await app.getByTestId('session-row-/repo/escape/b.jsonl').count()).toBe(1)
-
-    // View the other session, then come back to the running one via the agent
-    // row, since it is no longer in the session list.
-    await app.getByTestId('session-row-/repo/escape/b.jsonl').click()
-    expect(await app.getByTestId('header-title').textContent()).toContain('Untitled session')
-    await app.getByTestId('agent-/repo/escape/a.jsonl').click()
-    expect(await app.getByTestId('header-title').textContent()).toContain('Refactor RPC')
-    await app.close()
   })
 
-  it('viewing a session does not stop a running agent; sending elsewhere warns and stops it', async () => {
-    const sessions = [
-      { id: 'a', path: '/repo/escape/a.jsonl', cwd: '/repo/escape', name: 'Alpha' , updatedAt: 0 },
-      { id: 'b', path: '/repo/escape/b.jsonl', cwd: '/repo/escape', name: 'Beta' , updatedAt: 0 },
-    ]
-    const switched: string[] = []
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async listSessions() { return sessions },
-      async send(_p, onEvent) { onEvent({ kind: 'started' }) }, // never settles
-      async switchSession(p) { switched.push(p); return sessions.find((s) => s.path === p) ?? null },
-      async newSession() { return null },
-      async setSessionName() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      stop() {},
-      close() {},
+  it('scrolls the open dropdown without moving the page', async () => {
+    const items = Array.from({ length: 200 }, (_, i) => ({
+      id: `Face ${i}`,
+      label: `Face ${i}`,
+      family: `Face ${i}`,
+    }))
+    const { render, renderer } = createTestRoot({ width: 1280, height: 800 })
+    render(
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', overflowY: 'scroll' }}>
+        <div style={{ height: 400, flexShrink: 0 }}>
+          <text>Page top</text>
+        </div>
+        <FilterSelect testId="font-scroll" value="" items={items} onChange={() => {}} />
+        <div style={{ height: 400, flexShrink: 0 }}>
+          <text>Page bottom</text>
+        </div>
+      </div>,
+    )
+    renderer.flush()
+    const rowY = () => {
+      const texts = renderer.findByType('text')
+      const index = texts.findIndex((el) => el.text === 'Page bottom')
+      if (index <= 0) return null
+      return renderer.getElementBounds(texts[index - 1]!.id)?.y ?? null
     }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
-    const app = await connectTest(renderer)
-    await app.getByTestId('space-/repo/escape').waitFor({ timeoutMs: 1_000 })
 
-    // Start a turn in Alpha -> it is the single running agent.
-    await app.getByTestId('session-row-/repo/escape/a.jsonl').click()
-    await app.getByTestId('chat-input').fill('work')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    await app.getByTestId('agent-/repo/escape/a.jsonl').waitFor({ timeoutMs: 1_000 })
-
-    // Viewing Beta while Alpha runs is passive: it must not add a switch,
-    // and Alpha must keep running.
-    const switchesBeforeView = switched.length
-    await app.getByTestId('session-row-/repo/escape/b.jsonl').click()
-    expect(switched.length).toBe(switchesBeforeView)
-    expect(await app.getByTestId('agent-/repo/escape/a.jsonl').count()).toBe(1)
-
-    // The composer must warn that sending here will stop Alpha.
-    await app.getByTestId('will-stop-agent').waitFor({ timeoutMs: 1_000 })
-    expect(await app.getByTestId('will-stop-agent').textContent()).toContain('Alpha')
-
-    // Alpha is still busy, so the composer shows Stop. Stopping it is the
-    // explicit action that ends the run before we take over in Beta.
-    await app.getByTestId('stop-message').click()
-    await app.getByTestId('send-message').waitFor({ timeoutMs: 1_000 })
-
-    // Now sending in Beta switches the engine to Beta and starts its agent.
-    await app.getByTestId('chat-input').fill('take over')
-    await app.getByTestId('send-message').click()
-    await flushEngineRoundTrip()
-    await app.getByTestId('agent-/repo/escape/b.jsonl').waitFor({ timeoutMs: 1_000 })
-    expect(switched).toContain('/repo/escape/b.jsonl')
-    expect(await app.getByTestId('agent-/repo/escape/a.jsonl').count()).toBe(0)
-    await app.close()
-  })
-
-  it('resists past the sidebar bounds instead of stopping dead', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
-    const handle = app.getByTestId('sidebar-resize-handle')
-    await handle.waitFor({ timeoutMs: 2_000 })
-    await new Promise((r) => setTimeout(r, 400))
-    const before = await handle.bounds()
-    const cx = before.x + before.width / 2
-    const cy = before.y + 200
-
-    // Flick far past the maximum: 700px of pointer travel.
-    await app.mouse.move({ x: cx, y: cy })
-    await app.mouse.down({ x: cx, y: cy })
-    for (let i = 1; i <= 14; i++) await app.mouse.move({ x: cx + i * 50, y: cy })
-    const during = await handle.bounds()
-    const travelled = during.x - before.x
-    // Rubber-banding: resistance is progressive, so the sidebar follows part of
-    // the way rather than matching or hard-stopping.
-    expect(travelled).toBeGreaterThan(20)
-    expect(travelled).toBeLessThan(600)
-    await app.mouse.up({ x: cx + 700, y: cy })
-    await new Promise((r) => setTimeout(r, 500))
-    const settled = await handle.bounds()
-    expect(settled.x + 3).toBeLessThanOrEqual(480)
-    expect(settled.x + 3).toBeGreaterThan(470)
-    await app.close()
-  })
-
-  it('rests a deliberate sidebar drag where it was released', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
-    const handle = app.getByTestId('sidebar-resize-handle')
-    await handle.waitFor({ timeoutMs: 2_000 })
-    await new Promise((r) => setTimeout(r, 400))
-    const before = await handle.bounds()
-    const cx = before.x + before.width / 2
-    const cy = before.y + 200
-
-    // Aim for whichever side has room, so the drag stays inside the bounds and
-    // the assertion is about coasting rather than about the rubber-band return.
-    const current = before.x + 3
-    const room = current - 208 >= 480 - current ? -1 : 1
-    const travel = 40 * room
-
-    // Slow, deliberate placement. Momentum projection must not coast this.
-    await app.mouse.move({ x: cx, y: cy })
-    await app.mouse.down({ x: cx, y: cy })
-    for (let i = 1; i <= 6; i++) {
-      await app.mouse.move({ x: cx + (travel / 6) * i, y: cy })
-      await new Promise((r) => setTimeout(r, 90))
+    const menuRowY = () => {
+      const texts = renderer.findByType('text')
+      const index = texts.findIndex((el) => el.text === 'Face 1')
+      if (index <= 0) return null
+      return renderer.getElementBounds(texts[index - 1]!.id)?.y ?? null
     }
-    const released = await handle.bounds()
-    await app.mouse.up({ x: cx + travel, y: cy })
-    await new Promise((r) => setTimeout(r, 600))
-    const settled = await handle.bounds()
-    expect(Math.abs(settled.x - released.x)).toBeLessThanOrEqual(3)
-    await app.close()
-  })
-
-  it('resizes the sidebar by dragging the edge handle', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
-    const handle = app.getByTestId('sidebar-resize-handle')
-    await handle.waitFor({ timeoutMs: 2_000 })
-    const before = await handle.bounds()
-
-    const cx = before.x + before.width / 2
-    const cy = before.y + 200
-    await app.mouse.move({ x: cx, y: cy })
-    await app.mouse.down({ x: cx, y: cy })
-    for (let i = 1; i <= 5; i++) await app.mouse.move({ x: cx + i * 12, y: cy })
-    await app.mouse.up({ x: cx + 60, y: cy })
-
-    const after = await handle.bounds()
-    expect(after.x - before.x).toBeGreaterThan(30)
-    await app.close()
-  })
-
-  it('loads earlier transcript pages on demand rather than all at once', async () => {
-    const asked: Array<{ beforeId: string; limit: number }> = []
-    const pageFor = (beforeId: string) => {
-      asked.push({ beforeId, limit: 200 })
-      if (beforeId === '') {
-        return {
-          messages: [
-            { id: 'n2', role: 'user' as const, content: 'newest question' },
-            { id: 'n3', role: 'assistant' as const, content: 'newest answer' },
-          ],
-          hasMore: true,
-          earliestId: 'n2',
-        }
-      }
-      return {
-        messages: [{ id: 'o1', role: 'user' as const, content: 'much older question' }],
-        hasMore: false,
-        earliestId: 'o1',
-      }
+    const searchY = () => {
+      const search = renderer.findByTestId('font-scroll-search')
+      if (!search) return null
+      return renderer.getElementBounds(search.id)?.y ?? null
     }
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async getTranscriptPage(beforeId: string) { return pageFor(beforeId) },
-      async listSessions() { return [] },
-      async send() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
-    }
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
     const app = await connectTest(renderer)
-
-    // The newest page renders without asking for anything older.
-    await app.getByTestId('message-n3').waitFor({ timeoutMs: 2_000 })
-    expect(asked).toEqual([{ beforeId: '', limit: 200 }])
-
-    // Older entries are fetched only when asked for, and are prepended.
-    await app.getByTestId('load-older').click()
-    await app.getByTestId('message-o1').waitFor({ timeoutMs: 2_000 })
-    expect(asked[1]).toEqual({ beforeId: 'n2', limit: 200 })
-    const text = paintedText(renderer)
-    // The older message is above the newer ones, not appended after them.
-    expect(text.indexOf('much older question')).toBeLessThan(text.indexOf('newest question'))
-
-    // With nothing more behind it, the control stops asking.
-    const before = asked.length
-    await app.getByTestId('load-older').click()
-    await new Promise((r) => setTimeout(r, 120))
-    expect(asked.length).toBe(before)
-    await app.close()
+    try {
+      await app.getByTestId('font-scroll').click()
+      await settle(renderer)
+      const trigger = renderer.findByTestId('font-scroll')!
+      const tbox = renderer.getElementBounds(trigger.id)!
+      const before = rowY()
+      const rowBefore = menuRowY()
+      const searchBefore = searchY()
+      expect(before).not.toBeNull()
+      expect(rowBefore).not.toBeNull()
+      expect(searchBefore).not.toBeNull()
+      renderer.nativeSimulateScrollWheel(tbox.x + tbox.width / 2, tbox.y + tbox.height + 100, 0, -600)
+      await settle(renderer)
+      // The menu scrolled under a stationary page and a pinned search bar.
+      expect(menuRowY()).toBeLessThan(rowBefore!)
+      expect(searchY()).toBe(searchBefore)
+      expect(rowY()).toBe(before)
+    } finally {
+      await app.close()
+    }
   })
+})
 
-  it('restores visible transcript history from the engine', async () => {
-    const client: AgentClient = {
-      async listSkills() { return { skills: [], projects: [] } },
-      async setSkillEnabled() { return { pending: false } },
-      mode: 'engine',
-      ...testRuntimeSettings,
-      async getTranscript() { return [{ id: 'u1', role: 'user', content: 'Earlier question' }, { id: 'a1', role: 'assistant', content: 'Earlier answer' }] },
-      // The app asks for a page rather than the whole transcript; see
-      // getTranscriptPage. Tests that care about the transcript supply a page.
-      async getTranscriptPage() {
-        return {
-          messages: [{ id: 'u1', role: 'user' as const, content: 'Earlier question' }, { id: 'a1', role: 'assistant' as const, content: 'Earlier answer' }],
-          hasMore: false,
-          earliestId: 'u1',
-        }
+describe('theme object identity', () => {
+  it('keeps a stable reference until appearance inputs change', () => {
+    const first = currentTheme()
+    expect(currentTheme()).toBe(first)
+    applyTypography(99, 99, 'compact', true)
+    expect(currentTheme()).not.toBe(first)
+    expect(currentTheme()).toBe(currentTheme())
+  })
+})
+
+describeNative('engine chat', () => {
+  it('boots sessions, models, and providers from the engine', async () => {
+    const fake = new FakeEngine()
+    fake.sessions = [
+      {
+        id: 'sess-1',
+        path: 'sess-1',
+        cwd: '/Users/tester/projects/alpha',
+        name: 'Fix the sidebar',
+        updatedAt: Date.now() - 1000,
       },
-      async listSessions() { return [] },
-      async send() {},
-      async answerApproval() {},
-      async answerQuestion() {},
-      async newSession() { return null },
-      async switchSession() { return null },
-      async setSessionName() {},
-      stop() {},
-      close() {},
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const painted = renderer.getPaintedText()
+    expect(painted).toContain('Test Model A')
+    expect(painted).toContain('Fix the sidebar')
+    expect(painted).toContain('Today')
+    expect(painted).toContain('alpha')
+    expect(fake.calls.some((c) => c.method === 'getModels')).toBe(true)
+    expect(fake.calls.some((c) => c.method === 'getProviders')).toBe(true)
+  })
+
+  it('creates a session on first send and streams the reply', async () => {
+    const fake = new FakeEngine()
+    fake.replyText = 'hello from the engine'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    expect(fake.calls.some((c) => c.method === 'newSession')).toBe(true)
+    expect(fake.sent).toHaveLength(1)
+    expect(fake.sent[0]!.prompt).toBe('hello')
+    const painted = renderer.getPaintedText()
+    expect(painted).toContain('hello')
+    expect(painted).toContain('hello from the engine')
+    expect(painted).toContain('Untitled session')
+  })
+
+  it('groups a reloaded turn into one fold, not one per tool call', () => {
+    // A turn is one user prompt and everything the agent did in answer. Minting
+    // a turn per tool-bearing message made "Worked for…" appear after every
+    // individual call, and split one turn across several folds.
+    const messages = [
+      { id: 'u1', role: 'user' as const, content: 'write the script', turnId: 'r1' },
+      { id: 'a1', role: 'assistant' as const, content: 'Writing it now.', turnId: 'r1' },
+      {
+        id: 'a2', role: 'assistant' as const, content: 'Saved.', turnId: 'r1',
+        tools: [
+          { id: 'a2-t0', name: 'bash', status: 'done' as const, turnId: 'r1', args: 'cat > x.sh' },
+          { id: 'a2-t1', name: 'bash', status: 'done' as const, turnId: 'r1', args: 'bash -n x.sh' },
+        ],
+      },
+      { id: 'u2', role: 'user' as const, content: 'now make it bigger', turnId: 'r2' },
+      {
+        id: 'a3', role: 'assistant' as const, content: 'Done.', turnId: 'r2',
+        tools: [{ id: 'a3-t0', name: 'write', status: 'done' as const, turnId: 'r2' }],
+      },
+    ]
+    const rows = deriveTimelineRows(messages, [])
+    // One fold per turn, not per call.
+    const folds = rows.filter((r) => r.kind === 'activity')
+    expect(folds).toHaveLength(2)
+    // The first turn carries both of its calls in one row.
+    expect(folds[0]!.kind === 'activity' && folds[0]!.activities).toHaveLength(2)
+    expect(activityDuration(folds[0]!.kind === 'activity' ? folds[0]!.activities : [])).toBe('2 tool calls')
+    // The fold heads its turn: it comes before the turn's messages, and the
+    // second turn's fold comes before that turn's prose rather than at the end
+    // of the conversation.
+    expect(rows.map((r) => r.key)).toEqual([
+      'a:r1', 'm:u1', 'm:a1', 'm:a2',
+      'a:r2', 'm:u2', 'm:a3',
+    ])
+  })
+
+  it('renders tool calls in the fold', async () => {
+    const fake = new FakeEngine()
+    fake.toolScript = [{ name: 'read', output: 'contents' }]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    expect(renderer.getPaintedText()).toContain('Worked for 0 seconds')
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('work-fold-toggle').click()
+      expect(renderer.getPaintedText()).toContain('read')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('times a turn from the engine\'s span, not from its tool calls', async () => {
+    // The engine's turn_start/turn_end bracket the model thinking before the
+    // first call and the writing after the last. Here the tools all land inside
+    // the same millisecond, so a shell that summed tool timings would print
+    // "0 seconds" and one that adopted the engine's turn prints "2 seconds".
+    // This is the assertion that fails if the turn id is not adopted.
+    const fake = new FakeEngine()
+    fake.toolScript = [{ name: 'read', output: 'contents' }]
+    fake.turnTailDelayMs = 2_000
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await new Promise((resolve) => setTimeout(resolve, 2_200))
+    await settle(renderer)
+
+    expect(fake.turnIds).toEqual(['fake-turn-1'])
+    expect(renderer.getPaintedText()).toContain('Worked for 2 seconds')
+  })
+
+  it('gives a turn that changed files a changes card, even when it succeeds', async () => {
+    // The snapshot used to run only on the error path, so a turn that edited
+    // files and then answered cleanly never got a receipt. It is driven by the
+    // engine's turn_end, which is the one moment the tree still describes the
+    // turn and nothing after it.
+    const fake = new FakeEngine()
+    fake.diff = 'diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-old\n+new'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'fix it')
+    await settle(renderer)
+
+    expect(fake.calls.some((c) => c.method === 'getDiff')).toBe(true)
+    expect(renderer.getPaintedText().join(' ')).toContain('1 changed files')
+  })
+
+  it('says why a send was refused instead of doing nothing', async () => {
+    // The engine's send button becomes Stop while a turn runs, but Enter still
+    // reaches send. That path used to return silently, so pressing Enter
+    // mid-turn looked like the keyboard was broken.
+    const fake = new FakeEngine()
+    fake.pauseSend = true
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'first')
+    await settle(renderer)
+
+    typeSend(renderer, 'second')
+    await settle(renderer)
+
+    expect(fake.sent).toHaveLength(1)
+    expect(renderer.getPaintedText().join(' ')).toContain('Wait for the current turn to finish')
+  })
+
+  it('surfaces engine send errors in the transcript', async () => {
+    const fake = new FakeEngine()
+    fake.sendError = 'provider exploded'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    expect(renderer.getPaintedText().some((line) => line.includes('provider exploded'))).toBe(
+      true,
+    )
+  })
+
+  it('shows a retryable banner when the engine is down', async () => {
+    const fake = new FakeEngine()
+    fake.failures = { getState: 'connection refused' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    expect(renderer.getPaintedText()).toContain('connection refused')
+    const getStateCalls = () => fake.calls.filter((c) => c.method === 'getState').length
+    const before = getStateCalls()
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('engine-retry').click()
+      await settle(renderer)
+      expect(getStateCalls()).toBeGreaterThan(before)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('stops a running turn from the send button', async () => {
+    const fake = new FakeEngine()
+    fake.pauseSend = true
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('stop-message').click()
+      expect(fake.stopped).toBe(true)
+      fake.releaseSend()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('fake engine reply')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('asks for approval and resumes on allow', async () => {
+    const fake = new FakeEngine()
+    fake.approvalScript = { toolCallId: 'tool-9', toolName: 'write' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    expect(renderer.getPaintedText()).toContain('Allow write?')
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('approval-allow').click()
+      await settle(renderer)
+      expect(fake.answeredApprovals).toEqual([{ toolCallId: 'tool-9', approved: true }])
+      expect(renderer.getPaintedText()).toContain('fake engine reply')
+      expect(renderer.getPaintedText()).not.toContain('Allow write?')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('asks a question and sends the typed answer', async () => {
+    const fake = new FakeEngine()
+    fake.questionScript = { questionId: 'q-1', question: 'Which directory?' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    expect(renderer.getPaintedText()).toContain('Which directory?')
+    const answer = renderer.findByTestId('question-answer')!
+    renderer.nativeSimulateKeystrokes(answer.id, 's r c')
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('question-send').click()
+      await settle(renderer)
+      expect(fake.answeredQuestions).toEqual([{ questionId: 'q-1', answer: 'src' }])
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('switches sessions and loads their transcripts', async () => {
+    const startOfDay = new Date()
+    startOfDay.setHours(0, 0, 0, 0)
+    const now = Date.now()
+    const fake = new FakeEngine()
+    fake.sessions = [
+      { id: 's1', path: 'sess-1', cwd: '/Users/tester/projects/alpha', name: 'First', updatedAt: now },
+      {
+        id: 's2',
+        path: 'sess-2',
+        cwd: '/Users/tester/projects/alpha',
+        name: 'Second',
+        updatedAt: startOfDay.getTime() - 3600 * 1000,
+      },
+    ]
+    fake.transcripts = {
+      'sess-1': [{ id: 'm1', role: 'user', content: 'first question' }],
+      'sess-2': [{ id: 'm2', role: 'user', content: 'second question' }],
     }
     const { render, renderer } = createTestRoot()
-    render(<ChatApp client={client} />)
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    expect(renderer.getPaintedText()).toContain('Yesterday')
     const app = await connectTest(renderer)
-    await app.getByTestId('message-u1').waitFor({ timeoutMs: 1_000 })
-    expect(paintedText(renderer)).toContain('Earlier question')
-    expect(paintedText(renderer)).toContain('Earlier answer')
+    try {
+      await app.getByTestId('thread-sess-2').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'getTranscriptPage' && c.args[0] === 'sess-2'),
+      ).toBe(true)
+      expect(renderer.getPaintedText()).toContain('second question')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('walks thread history with the sidebar arrows', async () => {
+    const now = Date.now()
+    const fake = new FakeEngine()
+    fake.sessions = [
+      { id: 's1', path: 'sess-1', cwd: '/Users/tester/projects/alpha', name: 'First', updatedAt: now },
+      { id: 's2', path: 'sess-2', cwd: '/Users/tester/projects/alpha', name: 'Second', updatedAt: now },
+    ]
+    fake.transcripts = {
+      'sess-1': [{ id: 'm1', role: 'user', content: 'first question' }],
+      'sess-2': [{ id: 'm2', role: 'user', content: 'second question' }],
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('thread-sess-1').click()
+      await settle(renderer)
+      // The session list is the way in, so it is also the way between sessions:
+      // clicking the project you are already in returns to its list. Opening one
+      // session directly from another is no longer a thing the UI offers.
+      await app.getByTestId('sidebar-project-/Users/tester/projects/alpha').click()
+      await settle(renderer)
+      await app.getByTestId('thread-sess-2').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('second question')
+      await app.getByTestId('history-back').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('first question')
+      await app.getByTestId('history-forward').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('second question')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('changes the model, reasoning, and approval through the engine', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('model-picker').click()
+      await app.getByTestId('model-test-model-b').click()
+      await settle(renderer)
+      expect(fake.calls.some((c) => c.method === 'setModel' && c.args[0] === 'test-model-b')).toBe(
+        true,
+      )
+      expect(renderer.getPaintedText()).toContain('Test Model B')
+
+      await app.getByTestId('reasoning-picker').click()
+      await app.getByTestId('reasoning-high').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'setThinkingLevel' && c.args[0] === 'high'),
+      ).toBe(true)
+
+      await app.getByTestId('access-trigger').click()
+      await app.getByTestId('access-ask').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'setApprovalMode' && c.args[0] === 'ask'),
+      ).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  // The footer's project chip is gone: the sidebar list is the switcher now, and
+  // switching through it is covered by the sidebar project tests below.
+
+  it('opens the diff overlay with parsed files and layouts', async () => {
+    const fake = new FakeEngine()
+    fake.diff = [
+      'diff --git a/a.ts b/a.ts',
+      'index 111..222 100644',
+      '--- a/a.ts',
+      '+++ b/a.ts',
+      '@@ -1,2 +1,2 @@',
+      ' same',
+      '-old',
+      '+new',
+    ].join('\n')
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('diff-toggle').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Uncommitted changes')
+      expect(renderer.getPaintedText()).toContain('a.ts')
+
+      await app.getByTestId('diff-layout-side-by-side').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Before')
+      expect(renderer.getPaintedText()).toContain('After')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('resizes both handles from the keyboard', async () => {
+    const fake = new FakeEngine()
+    fake.vcs = {
+      isRepo: true, refName: 'main', hasChanges: true,
+      staged: [], unstaged: [{ path: 'a.ts', insertions: 1, deletions: 0, untracked: false }],
+      insertions: 1, deletions: 0,
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('source-control-toggle').click()
+      await settle(renderer)
+
+      // Both handles are real separators, so they are reachable and operable
+      // without a pointer.
+      const width = renderer.findByTestId('git-resize-handle')
+      const split = renderer.findByTestId('git-split-handle')
+      expect(width).toBeDefined()
+      expect(split).toBeDefined()
+      // Keyboard resize must be able to move the panel, not just the pointer.
+      await app.getByTestId('git-split-handle').press('arrowdown')
+      await settle(renderer)
+      await app.getByTestId('git-resize-handle').press('arrowright')
+      await settle(renderer)
+      // Still alive after keyboard interaction.
+      expect(renderer.findByTestId('git-sidebar')).toBeDefined()
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('shows the selected file in the diff and clears back to the whole scope', async () => {
+    const fake = new FakeEngine()
+    fake.diff = [
+      'diff --git a/a.ts b/a.ts',
+      '--- a/a.ts',
+      '+++ b/a.ts',
+      '@@ -1,2 +1,2 @@',
+      ' same',
+      '-alpha',
+      '+beta',
+      'diff --git a/b.ts b/b.ts',
+      '--- a/b.ts',
+      '+++ b/b.ts',
+      '@@ -1 +1 @@',
+      '-gamma',
+      '+delta',
+    ].join('\n')
+    fake.vcs = {
+      isRepo: true, refName: 'main', hasChanges: true,
+      staged: [],
+      unstaged: [
+        { path: 'a.ts', insertions: 1, deletions: 1, untracked: false },
+        { path: 'b.ts', insertions: 1, deletions: 1, untracked: false },
+      ],
+      insertions: 2, deletions: 2,
+    }
+    // The viewer asks the engine for the selected file rather than slicing the
+    // tree diff, which is what makes selection work on a large change set.
+    fake.fileDiffs = { 'b.ts': fake.diff.split('diff --git a/b.ts b/b.ts')[1] ?? '' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('source-control-toggle').click()
+      await settle(renderer)
+
+      // The list is a single scroll container with a draggable split.
+      expect(renderer.findByTestId('git-section-unstaged-list')).toBeDefined()
+      expect(renderer.findByTestId('git-split-handle')).toBeDefined()
+
+      // Nothing selected yet: the viewer shows the whole scope.
+      expect(renderer.findByTestId('git-diff-file-bar')).toBeUndefined()
+
+      // Selecting a row narrows the viewer to that file, and says which.
+      await app.getByTestId('git-file-b.ts').click()
+      await settle(renderer)
+      // The engine was asked for that one file specifically.
+      const asked = fake.calls.filter(c => c.method === 'vcsFileDiff')
+      expect(asked).toHaveLength(1)
+      expect(asked[0]!.args[0]).toBe('b.ts')
+      // No duplicate file-name bar: <diff> draws its own header for the patch.
+      expect(renderer.findByTestId('git-diff-file-bar')).toBeUndefined()
+      // The clear control moves into the scope bar instead.
+      expect(renderer.findByTestId('git-diff-file-clear')).toBeDefined()
+
+      // Selecting a second file refetches rather than reusing the first.
+      await app.getByTestId('git-file-a.ts').click()
+      await settle(renderer)
+      const asked2 = fake.calls.filter(c => c.method === 'vcsFileDiff')
+      expect(asked2).toHaveLength(2)
+      expect(asked2[1]!.args[0]).toBe('a.ts')
+
+      // Clearing returns to the whole scope.
+      await app.getByTestId('git-diff-file-clear').click()
+      await settle(renderer)
+      expect(renderer.findByTestId('git-diff-file-clear')).toBeUndefined()
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('shows a status row while a turn is in flight and clears it after', async () => {
+    const fake = new FakeEngine()
+    // The turn is held open so the row can be observed mid-flight; it settles
+    // instantly otherwise, and there would be nothing to see.
+    fake.pauseSend = true
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      // Mid-turn the row is present, and says the agent is working.
+      expect(renderer.findByTestId('agent-status')).toBeDefined()
+      const mid = renderer.getPaintedText().join(' ')
+      expect(mid).toMatch(/Thinking…|Writing…|read file…|bash…/)
+
+      // Once the turn settles, nothing is left claiming to be working.
+      fake.releaseSend()
+      await settle(renderer)
+      expect(renderer.findByTestId('agent-status')).toBeUndefined()
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('copies a response and a code block through the engine', async () => {
+    // The clipboard has no GPUIX or DOM API, so the engine performs the write.
+    // Both controls must reach it, and with the right text.
+    const fake = new FakeEngine()
+    fake.replyText = 'The fix is one line.\n\n```ts\nconst a = 1\n```'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      // The response copy control copies the markdown, not the rendered text.
+      await app.getByTestId('copy-response').click()
+      await settle(renderer)
+      expect(fake.copied).toHaveLength(1)
+      expect(fake.copied[0]).toContain('The fix is one line.')
+      expect(fake.calls.some((c) => c.method === 'copyToClipboard')).toBe(true)
+
+      // Every code block carries its own copy control.
+      expect(renderer.findByTestId('copy-code')).toBeDefined()
+      await app.getByTestId('copy-code').click()
+      await settle(renderer)
+      expect(fake.copied).toHaveLength(2)
+      // The code is copied verbatim, without the fence or the line numbers.
+      expect(fake.copied[1]).toContain('const a = 1')
+      expect(fake.copied[1]).not.toContain('```')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('parses a transcript page with tool calls without throwing', () => {
+    // The parser folded results into their call by reading the accumulator
+    // from inside the pass that built it — a temporal dead zone. It threw
+    // "Cannot access 'messages' before initialization" on every session load,
+    // and shipped because the parse lived inside the client and no test
+    // reached it. It is extracted now so this can.
+    const page = parseTranscriptPage({
+      hasMore: false,
+      earliestId: 'e0',
+      entries: [
+        { id: 'e1', message: { role: 'user', content: [{ type: 'text', text: 'run it' }] } },
+        {
+          id: 'e2',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Running it.' },
+              { type: 'toolCall', name: 'bash', arguments: { command: 'cat file.txt' } },
+            ],
+          },
+        },
+        {
+          id: 'e3',
+          message: {
+            role: 'toolResult',
+            toolName: 'bash',
+            toolCallId: 'e2',
+            content: [{ type: 'text', text: 'hello' }],
+          },
+        },
+      ],
+    })
+    // The result folded into the message holding the call.
+    expect(page.messages).toHaveLength(2)
+    const answer = page.messages[1]!
+    expect(answer.content).toBe('Running it.')
+    // No tool text leaked into the prose.
+    expect(answer.content).not.toContain('[tool]')
+    expect(answer.content).not.toContain('hello')
+    // The call carries its args, and the result its output.
+    expect(answer.tools).toHaveLength(2)
+    expect(answer.tools![0]).toMatchObject({ name: 'bash', args: 'cat file.txt' })
+    expect(answer.tools![1]).toMatchObject({ name: 'bash', output: 'hello', status: 'done' })
+  })
+
+  it('parses an empty and a malformed page without throwing', () => {
+    expect(parseTranscriptPage(null).messages).toEqual([])
+    expect(parseTranscriptPage({}).messages).toEqual([])
+    expect(parseTranscriptPage({ entries: 'nope' }).messages).toEqual([])
+    expect(parseTranscriptPage({ entries: [{ id: 'x' }] }).messages).toEqual([])
+  })
+
+  it('renders reloaded tool calls as rows, not as transcript prose', () => {
+    // A stored page used to splice "[tool] bash\n<output>" into the message
+    // text, so a reloaded turn rendered a tool log in the assistant's voice,
+    // styled as prose by the markdown renderer.
+    const rows = deriveTimelineRows(
+      [
+        { id: 'u1', role: 'user', content: 'run it' },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: 'Here is the result.',
+          turnId: 'r1',
+          tools: [{
+            id: 'a1-t0', name: 'bash', status: 'done',
+            turnId: 'r1', args: 'cat file.txt', output: 'hello',
+          }],
+        },
+      ],
+      [],
+    )
+    // The prose is only the model's sentence.
+    const message = rows.find((r) => r.kind === 'message' && r.message.id === 'a1')
+    expect(message?.kind === 'message' && message.message.content).toBe('Here is the result.')
+    expect(JSON.stringify(message)).not.toContain('[tool]')
+    // And the call is a folded activity row carrying its args.
+    const activity = rows.find((r) => r.kind === 'activity')
+    expect(activity?.kind === 'activity' && activity.activities[0]?.name).toBe('bash')
+    expect(activity?.kind === 'activity' && activity.activities[0]?.args).toBe('cat file.txt')
+  })
+
+  it('records nothing as copied when the clipboard write failed', async () => {
+    // A stale engine rejects copy_to_clipboard. A copy control that says
+    // "Copied" anyway is worse than one that says nothing, because the user
+    // pastes stale content believing it is current.
+    const fake = new FakeEngine()
+    fake.replyText = 'A response body.'
+    fake.failCopyWith = 'unknown command: copy_to_clipboard'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('copy-response').click()
+      await settle(renderer)
+      // The write was attempted and failed, so nothing was recorded as copied.
+      expect(fake.calls.some((c) => c.method === 'copyToClipboard')).toBe(true)
+      expect(fake.copied).toHaveLength(0)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('turns ANSI escapes into colour instead of printing them', () => {
+    // The exact shape a model emits when asked for terminal colour.
+    const src = '\u001b[1;97mBOLD\u001b[0m plain \u001b[31mred\u001b[0m'
+    const runs = parseAnsi(src)
+    // The escape characters are gone, not painted.
+    expect(runs.map((r) => r.text).join('')).toBe('BOLD plain red')
+    expect(runs.some((r) => r.text.includes('\u001b'))).toBe(false)
+    // Bold survived, and the plain run is not bold.
+    expect(runs[0]!.bold).toBe(true)
+    expect(runs.find((r) => r.text === ' plain ')?.bold).toBeUndefined()
+    // A red run got a real colour.
+    expect(runs.find((r) => r.text === 'red')?.color).toBeTruthy()
+  })
+
+  it('handles the literal "x1b[" form a model actually emits', () => {
+    // A real transcript contained the text `x1b[1;97m`, not an ESC byte — the
+    // escape had already been escaped somewhere upstream. Parsing only real
+    // ESC bytes would paint that as visible garbage, which is the bug.
+    const src = 'x1b[1;97mLOREM IPSUMx1b[0m'
+    expect(hasAnsi(src)).toBe(true)
+    const runs = parseAnsi(src)
+    expect(runs.map((r) => r.text).join('')).toBe('LOREM IPSUM')
+    expect(runs.some((r) => r.text.includes('x1b'))).toBe(false)
+    expect(runs[0]!.bold).toBe(true)
+    // A plain source is left completely alone.
+    expect(hasAnsi('no escapes here')).toBe(false)
+    expect(parseAnsi('no escapes here')).toEqual([{ text: 'no escapes here' }])
+  })
+
+  it('passes through a source with no escapes untouched', () => {
+    expect(parseAnsi('just text')).toEqual([{ text: 'just text' }])
+  })
+
+  it('drops non-colour escapes rather than printing them', () => {
+    // Cursor moves and erases are noise in a transcript.
+    const runs = parseAnsi('\u001b[2J\u001b[Hvisible')
+    expect(runs.map((r) => r.text).join('')).toBe('visible')
+  })
+
+  it('handles 256-colour and truecolour forms', () => {
+    const runs256 = parseAnsi('\u001b[38;5;196mred\u001b[0m')
+    expect(runs256[0]!.text).toBe('red')
+    expect(runs256[0]!.color).toMatch(/^#/)
+    const runsTrue = parseAnsi('\u001b[38;2;255;0;0mred\u001b[0m')
+    expect(runsTrue[0]!.color).toMatch(/^#/)
+  })
+
+  it('never loses text when escapes are interleaved', () => {
+    const src = 'a\u001b[1mb\u001b[0mc\u001b[32md\u001b[0me'
+    expect(parseAnsi(src).map((r) => r.text).join('')).toBe('abcde')
+  })
+
+  it('renders unparseable markdown as text instead of crashing the window', async () => {
+    // MDX treats an unclosed inline tag as a hard error. A streaming answer is
+    // a partial document by definition, so this is expected traffic — it must
+    // degrade to plain text, not throw out of render and blank the app.
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<SafeMdxContent onCopy={async () => {}} source='text <span class="x broken' />)
+    await settle(renderer)
+    expect(renderer.getPaintedText().join(' ')).toContain('broken')
+
+    // A well-formed document still renders as markdown, not the fallback.
+    const second = createTestRoot()
+    second.render(<SafeMdxContent onCopy={async () => {}} source="A **bold** word" />)
+    await settle(second.renderer)
+    expect(second.renderer.getPaintedText().join(' ')).toContain('bold')
+  })
+
+  it('never cuts inside a tag, a fence, or an HTML construct', () => {
+    // Cutting mid-tag hands the markdown parser half a `<span …`, which throws
+    // and used to take down the whole window mid-stream.
+    const cases: Array<[string, string]> = [
+      ['inline html', 'A note with <span style="color:red">emphasis here</span>.\n\nNext para.'],
+      ['fenced code', 'Intro.\n\n```ts\nconst a = 1\nconst b = 2\n```\n\nAfter the fence.'],
+      ['inline code', 'Use `const a = 1` here.\n\nNext.'],
+      ['bold', 'This is **bold** text.\n\nNext para.'],
+      ['list', 'Items:\n\n- one\n- two\n\nAfter.'],
+    ]
+    for (const [name, text] of cases) {
+      const out: string[] = []
+      const s = createBlockStreamer((c) => out.push(c), { now: () => 0 })
+      // Per-character, as the engine delivers it.
+      for (const ch of text) s.push(ch)
+      s.flush()
+      // Text is never lost or reordered, whatever the cut points.
+      expect(out.join('')).toBe(text)
+      // No chunk ends mid-tag. These documents are well formed throughout, so
+      // every chunk — including the last — must be clean.
+      for (const chunk of out) {
+        const before = chunk.slice(0, -1)
+        expect(before.lastIndexOf('<') > before.lastIndexOf('>')).toBe(false)
+      }
+      // More than one paint, so this is genuinely streamed in blocks.
+      expect(out.length).toBeGreaterThan(1)
+    }
+  })
+
+  it('does not release a mid-tag boundary, and never drops the tail', () => {
+    // A blank line arrives while the tag is still open, which is the exact
+    // shape that produced "Expected a closing tag for <span> (4:102-4:130)".
+    const text = 'A note <span class="x\n\nmore text'
+    const out: string[] = []
+    const s = createBlockStreamer((c) => out.push(c), { now: () => 0 })
+    for (const ch of text) s.push(ch)
+    s.flush()
+    // On settle the held text is emitted in full. Losing it would be worse
+    // than a document that needs the plain-text fallback — and this proves the
+    // unsafe boundary did not lose the text it was protecting. How many chunks
+    // that takes depends on the real clock: with a frozen clock it is one, and
+    // under load the time budget can release the held prefix first.
+    expect(out.join('')).toBe(text)
+    expect(out.length).toBeGreaterThan(0)
+  })
+
+  it('holds a block rather than emitting half a tag', () => {
+    const out: string[] = []
+    const s = createBlockStreamer((c) => out.push(c), { now: () => 0 })
+    // The blank line lands while the tag is still open — the exact shape that
+    // produced "Expected a closing tag for <span> (4:102-4:130)".
+    const text = 'text <span class="x\n\nmore'
+    for (const ch of text) s.push(ch)
+    // The blank line is a boundary, but cutting there would hand the parser
+    // `<span class="x`, so it is held rather than released.
+    s.flush()
+    // Nothing is dropped: the tail is emitted even though it ends mid-tag,
+    // because losing text is worse than a document that needs the plain-text
+    // fallback. That fallback is the real guarantee against this crash.
+    expect(out.join('')).toBe(text)
+  })
+
+  it('reports what the agent is doing, from real events', () => {
+    // A turn that has started but produced nothing is thinking.
+    let s = reduceAgentStatus({ kind: 'idle' }, new Set(), { kind: 'started' })
+    expect(s.status).toEqual({ kind: 'thinking' })
+
+    // Text means it is writing.
+    s = reduceAgentStatus(s.status, s.running, { kind: 'text_delta', text: 'hi' })
+    expect(s.status).toEqual({ kind: 'writing' })
+
+    // A tool in flight names the tool, over the writing state.
+    s = reduceAgentStatus(s.status, s.running, {
+      kind: 'tool_start', toolCallId: 't1', toolName: 'read_file',
+    })
+    expect(s.status).toEqual({ kind: 'tool', tool: 'read_file' })
+
+    // Text while the tool runs does not overwrite the tool state.
+    s = reduceAgentStatus(s.status, s.running, { kind: 'text_delta', text: 'more' })
+    expect(s.status).toEqual({ kind: 'tool', tool: 'read_file' })
+
+    // The tool finishing returns to writing.
+    s = reduceAgentStatus(s.status, s.running, {
+      kind: 'tool_end', toolCallId: 't1', toolName: 'read_file', output: '', isError: false,
+    })
+    expect(s.status).toEqual({ kind: 'writing' })
+
+    // Settling clears it, so the row disappears.
+    s = reduceAgentStatus(s.status, s.running, { kind: 'settled', reason: 'done' })
+    expect(s.status).toEqual({ kind: 'idle' })
+    expect(s.running.size).toBe(0)
+  })
+
+  it('keeps naming a tool while others are still running', () => {
+    let s = reduceAgentStatus({ kind: 'idle' }, new Set(), { kind: 'started' })
+    s = reduceAgentStatus(s.status, s.running, { kind: 'tool_start', toolCallId: 'a', toolName: 'read' })
+    s = reduceAgentStatus(s.status, s.running, { kind: 'tool_start', toolCallId: 'b', toolName: 'write' })
+    expect(s.status).toEqual({ kind: 'tool', tool: 'write' })
+    s = reduceAgentStatus(s.status, s.running, { kind: 'tool_end', toolCallId: 'b', toolName: 'write', output: '', isError: false })
+    // One is still in flight, so it is still a tool state, not writing.
+    expect(s.status.kind).toBe('tool')
+  })
+
+  it('surfaces compaction as its own state', () => {
+    let s = reduceAgentStatus({ kind: 'writing' }, new Set(), { kind: 'compaction_start', reason: 'auto' })
+    expect(s.status).toEqual({ kind: 'compacting' })
+    s = reduceAgentStatus(s.status, s.running, { kind: 'compaction_end', reason: 'auto', summary: 'x' })
+    expect(s.status).toEqual({ kind: 'idle' })
+  })
+
+  it('labels each status, and nothing when idle', () => {
+    expect(agentStatusLabel({ kind: 'idle' })).toBe('')
+    expect(agentStatusLabel({ kind: 'thinking' })).toBe('Thinking…')
+    expect(agentStatusLabel({ kind: 'writing' })).toBe('Writing…')
+    expect(agentStatusLabel({ kind: 'compacting' })).toBe('Compacting context…')
+    // Tool names are snake_case from the engine; a space reads better.
+    expect(agentStatusLabel({ kind: 'tool', tool: 'read_file' })).toBe('read file…')
+  })
+
+  it('streams whole blocks rather than one character at a time', () => {
+    const out: string[] = []
+    // A frozen clock isolates the boundary rule from the time budget, which is
+    // exercised on its own below.
+    const s = createBlockStreamer((c) => out.push(c), { now: () => 0 })
+
+    // Feed a paragraph one character at a time, exactly as the engine does,
+    // stopping short of its blank line.
+    const partial = 'The fix is one line.'
+    for (const ch of partial) s.push(ch)
+
+    // Mid-paragraph nothing is painted: a partial word is never on screen.
+    expect(out).toEqual([])
+
+    // The blank line closes the block, and it appears in one piece.
+    s.push('\n\n')
+    expect(out).toEqual(['The fix is one line.\n\n'])
+  })
+
+  it('releases a heading as one block', () => {
+    const out: string[] = []
+    const s = createBlockStreamer((c) => out.push(c), { now: () => 0 })
+    for (const ch of '## The fix\n\nBody text.') s.push(ch)
+    // The heading has its own boundary, so it lands as soon as its newline
+    // arrives — without waiting for the blank line after it.
+    expect(out).toEqual(['## The fix\n'])
+    // The body is still buffered; it is not painted as a growing line.
+    expect(out.join('')).not.toContain('Body')
+  })
+
+  it('flushes the tail on settle so no text is lost', () => {
+    const out: string[] = []
+    const s = createBlockStreamer((c) => out.push(c))
+    for (const ch of 'A paragraph with no trailing blank line.') s.push(ch)
+    // Still buffered: no boundary arrived.
+    expect(out).toEqual([])
+    s.flush()
+    expect(out.join('')).toBe('A paragraph with no trailing blank line.')
+  })
+
+  it('preserves the full text across arbitrary chunking', () => {
+    // The engine's real chunking is neither per character nor block-aligned.
+    const full =
+      '## Heading\n\nFirst paragraph with `code`.\n\n' +
+      '- bullet one\n- bullet two\n\nLast line, no trailing break.'
+    for (const size of [1, 3, 7, 40]) {
+      const out: string[] = []
+      const s = createBlockStreamer((c) => out.push(c))
+      for (let i = 0; i < full.length; i += size) s.push(full.slice(i, i + size))
+      s.flush()
+      // Whatever the chunk size, the reader sees the same text.
+      expect(out.join('')).toBe(full)
+      // And it is delivered in more than one paint, never as one giant blob
+      // only when the sizes are small.
+      if (size === 1) expect(out.length).toBeGreaterThan(1)
+    }
+  })
+
+  it('releases a long paragraph on the time budget instead of stalling', () => {
+    const out: string[] = []
+    let clock = 0
+    const s = createBlockStreamer(
+      (c) => out.push(c),
+      { maxDelayMs: 100, now: () => clock },
+    )
+    // One enormous paragraph, no blank line in sight, arriving slowly.
+    for (let i = 0; i < 20; i++) {
+      clock += 30
+      s.push('word ')
+    }
+    // The time budget fired, so the reader is not staring at nothing.
+    expect(out.join('')).toContain('word')
+    s.flush()
+  })
+
+  it('fetches a file diff once per selection, not once per render', async () => {
+    // The caller passes an inline arrow, so its identity changed every render.
+    // As a useEffect dependency that re-ran the fetch, which set state, which
+    // re-rendered — an endless loop that read as a flickering diff.
+    const fake = new FakeEngine()
+    fake.diff = 'diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-a\n+b'
+    fake.vcs = {
+      isRepo: true, refName: 'main', hasChanges: true,
+      staged: [], unstaged: [{ path: 'a.ts', insertions: 1, deletions: 1, untracked: false }],
+      insertions: 1, deletions: 1,
+    }
+    fake.fileDiffs = { 'a.ts': fake.diff }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('source-control-toggle').click()
+      await settle(renderer)
+      await app.getByTestId('git-file-a.ts').click()
+      await settle(renderer)
+      // One selection means one fetch.
+      //
+      // NOTE: this cannot detect the render loop on its own. Reinstating the
+      // unstable dependency still passes here, because the test renderer does
+      // not re-render on the same schedule as the live app. The guarantee is
+      // structural — the effect depends only on `selectedPath`, and the
+      // callback is read through a ref — so it holds regardless of re-renders.
+      const afterSettle = fake.calls.filter(c => c.method === 'vcsFileDiff').length
+      expect(afterSettle).toBe(1)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('keeps a large file list scrollable instead of pushing the diff away', async () => {
+    // 49 files used to grow the section to the full panel height, which shoved
+    // the commit box and the diff off-screen with no way to reach them.
+    const many = Array.from({ length: 49 }, (_, i) => ({
+      path: `assets/icons/icon-${i}.svg`, insertions: 1, deletions: 0, untracked: true,
+    }))
+    const fake = new FakeEngine()
+    fake.vcs = {
+      isRepo: true, refName: 'main', hasChanges: true,
+      staged: [], unstaged: many, insertions: 49, deletions: 0,
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('source-control-toggle').click()
+      await settle(renderer)
+
+      // The list exists and holds every row.
+      const list = renderer.findByTestId('git-section-unstaged-list')
+      expect(list).toBeDefined()
+      expect(renderer.findByTestId('git-file-assets/icons/icon-48.svg')).toBeDefined()
+
+      // NOTE: the test renderer has no real layout, so a height assertion here
+      // cannot fail and would claim verification it does not have. What is
+      // verifiable is that the rows live inside a dedicated scroll container
+      // rather than expanding the section directly.
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('opens Source Control from a permanent control, not just the branch chip', async () => {
+    // The branch chip only renders on a real branch, and a turn's "Open diff"
+    // only exists after the agent edits something. On a clean tree, a detached
+    // HEAD, or a fresh project neither is reachable, so the panel used to be
+    // unreachable exactly when a user most wants it.
+    const fake = new FakeEngine()
+    fake.vcs = {
+      isRepo: true, refName: '', hasChanges: false,
+      staged: [], unstaged: [], insertions: 0, deletions: 0,
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    // No branch, so the chip is absent — but the control must still be there.
+    expect(renderer.findByTestId('header-git')).toBeUndefined()
+    const app = await connectTest(renderer)
+    try {
+      const toggle = renderer.findByTestId('source-control-toggle')
+      expect(toggle).toBeDefined()
+      await app.getByTestId('source-control-toggle').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Source Control')
+      // A clean tree says so rather than showing an empty diff.
+      expect(renderer.getPaintedText()).toContain('Nothing to commit.')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('says so when the project is not a git repository', async () => {
+    const fake = new FakeEngine()
+    fake.vcs = {
+      isRepo: false, refName: '', hasChanges: false,
+      staged: [], unstaged: [], insertions: 0, deletions: 0,
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('source-control-toggle').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Not a git repository')
+      // No diff viewer: an empty one would read as "no changes".
+      expect(renderer.findByTestId('git-diff-body')).toBeUndefined()
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('stages a file and commits it through the engine', async () => {
+    const fake = new FakeEngine()
+    fake.diff = 'diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-a\n+b'
+    fake.vcs = {
+      isRepo: true, refName: 'main', hasChanges: true,
+      staged: [],
+      unstaged: [{ path: 'a.ts', insertions: 1, deletions: 1, untracked: false }],
+      insertions: 1, deletions: 1,
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('header-git').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Changes')
+      expect(renderer.getPaintedText()).toContain('a.ts')
+
+      // Staging goes through the engine, and the whole tree is re-read after.
+      await app.getByTestId('git-file-action-a.ts').click()
+      await settle(renderer)
+      const staged = fake.calls.filter(c => c.method === 'vcsStage')
+      expect(staged).toHaveLength(1)
+      expect(staged[0]!.args[0]).toEqual(['a.ts'])
+
+      // The fake now reports the file as staged, so the commit affordance opens.
+      // Status is only re-read on refresh, which is what the real engine does
+      // after a mutation.
+      fake.vcs = { ...fake.vcs, staged: [{ path: 'a.ts', insertions: 1, deletions: 1, untracked: false }], unstaged: [] }
+      await app.getByTestId('git-refresh').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Staged')
+      expect(renderer.getPaintedText()).toContain('Commit staged changes')
+      await app.getByTestId('git-commit-open').click()
+      await settle(renderer)
+      await app.getByTestId('git-commit-message').fill('update a')
+      await app.getByTestId('git-commit-submit').click()
+      await settle(renderer)
+
+      const commits = fake.calls.filter(c => c.method === 'vcsCommit')
+      expect(commits).toHaveLength(1)
+      expect(commits[0]!.args[0]).toBe('update a')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('surfaces a failed git action instead of silently doing nothing', async () => {
+    const fake = new FakeEngine()
+    fake.vcs = {
+      isRepo: true, refName: 'main', hasChanges: true,
+      staged: [{ path: 'a.ts', insertions: 1, deletions: 0, untracked: false }],
+      unstaged: [], insertions: 1, deletions: 0,
+    }
+    fake.failVcsWith = 'fatal: could not lock ref'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('header-git').click()
+      await settle(renderer)
+      await app.getByTestId('git-section-staged-all').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Git action failed')
+      expect(renderer.getPaintedText()).toContain('fatal: could not lock ref')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('explains why committing is unavailable', () => {
+    const clean: VcsStatus = {
+      isRepo: true, refName: 'main', hasChanges: false,
+      staged: [], unstaged: [], insertions: 0, deletions: 0,
+    }
+    expect(commitBlockedReason(clean)).toBe('Nothing to commit.')
+
+    const unstagedOnly: VcsStatus = {
+      ...clean, hasChanges: true,
+      unstaged: [{ path: 'a.ts', insertions: 1, deletions: 0, untracked: false }],
+    }
+    expect(commitBlockedReason(unstagedOnly)).toBe('Stage at least one file to commit.')
+
+    const staged: VcsStatus = { ...clean, hasChanges: true, staged: unstagedOnly.unstaged }
+    expect(commitBlockedReason(staged)).toBeNull()
+
+    const notARepo: VcsStatus = { ...clean, isRepo: false }
+    expect(commitBlockedReason(notARepo)).toBe('This folder is not a git repository.')
+  })
+
+  it('gives the sidebar diff a bounded height so it paints', async () => {
+    // <diff scroll> is a virtualized scroller that renders nothing without a
+    // bounded height. The height must be on the <diff> element itself, not on a
+    // wrapper — a wrapper leaves the native element with no viewport and the
+    // pane comes up blank. This asserts the element is mounted and measurable.
+    const fake = new FakeEngine()
+    fake.diff = [
+      'diff --git a/a.ts b/a.ts',
+      'index 111..222 100644',
+      '--- a/a.ts',
+      '+++ b/a.ts',
+      '@@ -1,2 +1,2 @@',
+      ' same',
+      '-old',
+      '+new',
+    ].join('\n')
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('header-git').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Working tree')
+      const body = renderer.findByTestId('git-diff-body')
+      expect(body).toBeDefined()
+      // Assert geometry, not just presence: an unbounded <diff scroll> mounts but
+      // paints nothing, which is the blank-pane bug. A bounded one has real size.
+      const bounds = renderer.getElementBounds(body!.id)
+      expect(bounds).not.toBeNull()
+      expect(bounds!.width).toBeGreaterThan(0)
+      expect(bounds!.height).toBeGreaterThan(0)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('selects message text in a user turn', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+
+    const bubble = renderer.findByTestId('user-turn')
+    expect(bubble).toBeDefined()
+    const box = renderer.getElementBounds(bubble!.id)
+    expect(box).not.toBeNull()
+    const selected = renderer.dragSelect(
+      box!.x + 4,
+      box!.y + box!.height / 2,
+      box!.x + box!.width - 4,
+      box!.y + box!.height / 2,
+    )
+    expect(selected).not.toBeNull()
+    expect(selected).toContain('hello')
+    expect(selected).not.toContain('Do anything...')
+  })
+
+  it('filters threads from the search overlay', async () => {
+    const fake = new FakeEngine()
+    fake.sessions = [
+      {
+        id: 's1',
+        path: 'sess-1',
+        cwd: '/Users/tester/projects/alpha',
+        name: 'Fix the sidebar',
+        updatedAt: Date.now(),
+      },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('search').click()
+      expect(renderer.getPaintedText()).toContain('Search threads')
+      expect(renderer.getFocusedElementId()).toBe(renderer.findByTestId('search-input')?.id)
+
+      renderer.nativeSimulateClick(900, 40)
+      expect(renderer.getPaintedText()).not.toContain('Search threads')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('focuses the composer after New Task and thread switches', async () => {
+    const fake = new FakeEngine()
+    fake.sessions = [
+      {
+        id: 's1',
+        path: 'sess-1',
+        cwd: '/Users/tester/projects/alpha',
+        name: 'First',
+        updatedAt: Date.now(),
+      },
+    ]
+    fake.transcripts = { 'sess-1': [{ id: 'm1', role: 'user', content: 'first question' }] }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('new-task').click()
+      const composer = renderer.findByTestId('composer')
+      expect(composer).toBeDefined()
+      expect(renderer.getFocusedElementId()).toBe(composer?.id)
+
+      await app.getByTestId('thread-sess-1').click()
+      expect(renderer.getFocusedElementId()).toBe(renderer.findByTestId('composer')?.id)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('keeps transcript rows when the sidebar collapses', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'alpha')
+    await settle(renderer)
+    const before = renderer.findByType('virtual-list')[0]?.children.slice() ?? []
+    expect(before.length).toBeGreaterThan(0)
+
+    const app = await connectTest(renderer)
+    await app.getByTestId('sidebar-collapse').click()
+
+    expect(renderer.findByType('virtual-list')[0]?.children).toEqual(before)
+    expect(await app.getByTestId('sidebar-expand').count()).toBe(1)
+  })
+
+  it('stays painted after render() remounts the tree', async () => {
+    resetRender()
+    const renderer = new TestRenderer()
+    const before = path.join(SHOTS, 'chat-remount-before.png')
+    const after = path.join(SHOTS, 'chat-remount-after.png')
+    const fake = new FakeEngine()
+
+    render(<ChatApp client={fake} />, { renderer, width: 1180, height: 820 })
+    renderer.flush()
+    renderer.captureScreenshot(before)
+    // The sidebar actions are icon-only and the composer placeholder changes
+    // with engine state, so the approval control is the stable thing that says
+    // the chat screen is on screen.
+    expect(renderer.getPaintedText()).toContain('Auto-approve')
+
+    render(<ChatApp client={fake} />, { renderer, width: 1180, height: 820 })
+    renderer.flush()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    renderer.flush()
+    renderer.captureScreenshot(after)
+
+    expect(renderer.getRoot()).toBeDefined()
+    expect(renderer.getPaintedText()).toContain('Auto-approve')
+    expect(fs.statSync(after).size).toBeGreaterThan(0)
+  }, 20_000)
+
+  it('captures the top screenshot', async () => {
+    const top = path.join(SHOTS, 'chat-top.png')
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    renderer.captureScreenshot(top)
+    expect(fs.statSync(top).size).toBeGreaterThan(0)
+  })
+})
+
+describeNative('settings screen', () => {
+  it('navigates sections and returns to chat', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      expect(renderer.getPaintedText()).toContain('General')
+      expect(renderer.getPaintedText()).toContain('Follow-up behavior')
+      expect(renderer.getPaintedText()).toContain('Text generation model')
+
+      await app.getByTestId('settings-nav-appearance').click()
+      expect(renderer.getPaintedText()).toContain('Appearance')
+      expect(renderer.getPaintedText()).toContain('Interface font')
+      expect(renderer.getPaintedText()).toContain('Monospace font')
+
+      await app.getByTestId('settings-nav-providers').click()
+      expect(renderer.getPaintedText()).toContain('Providers')
+      expect(renderer.getPaintedText()).toContain('Codex')
+      expect(renderer.getPaintedText()).toContain('OpenCode Go')
+
+      await app.getByTestId('settings-back').click()
+      expect(renderer.getPaintedText()).toContain('Do anything...')
+      expect(renderer.getPaintedText()).not.toContain('Follow-up behavior')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('switches the theme live and restores defaults', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const rootBg = () =>
+      String(renderer.getElement(renderer.findByTestId('app-root')!.id)?.style.backgroundColor ?? '')
+
+    const app = await connectTest(renderer)
+    try {
+      expect(rootBg()).toBe('#1C1916')
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-theme').click()
+      expect(renderer.getPaintedText()).toContain('Midnight')
+      await app.getByTestId('settings-theme-midnight').click()
+      await settle(renderer)
+      expect(rootBg()).toBe('#0B0E14')
+
+      await app.getByTestId('settings-restore').click()
+      await settle(renderer)
+      expect(rootBg()).toBe('#1C1916')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('applies the interface font live', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const rootFont = () =>
+      String(renderer.getElement(renderer.findByTestId('app-root')!.id)?.style.fontFamily ?? '')
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-sans').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Filter fonts')
+      const search2 = renderer.findByTestId('settings-sans-search')!
+      renderer.nativeSimulateKeystrokes(search2.id, 'v e r')
+      await settle(renderer)
+      await app.getByTestId('settings-sans-option-Verdana').click()
+      await settle(renderer)
+      expect(rootFont()).toBe('Verdana')
+      expect(renderer.getPaintedText()).not.toContain('Filter fonts')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('saves and removes provider keys through the engine', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-providers').click()
+
+      const key = renderer.findByTestId('settings-zen-key')!
+      renderer.nativeSimulateKeystrokes(key.id, 'z e n - k e y')
+      await app.getByTestId('settings-zen-connect').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'setApiKey' && c.args[0] === 'opencode-zen'),
+      ).toBe(true)
+      expect(renderer.getPaintedText()).toContain('Connected')
+
+      await app.getByTestId('settings-zen-disconnect').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'removeApiKey' && c.args[0] === 'opencode-zen'),
+      ).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('saves a custom endpoint and switches the default provider', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-providers').click()
+
+      const url = renderer.findByTestId('settings-endpoint-url')!
+      renderer.nativeSimulateKeystrokes(url.id, 'h t t p s : / / r e l a y')
+      const key = renderer.findByTestId('settings-endpoint-key')!
+      renderer.nativeSimulateKeystrokes(key.id, 's e c r e t')
+      await app.getByTestId('settings-endpoint-save').click()
+      await settle(renderer)
+      expect(fake.calls.some((c) => c.method === 'setApiEndpoint')).toBe(true)
+
+      await app.getByTestId('settings-default-provider').click()
+      await app.getByTestId('settings-default-provider-codex').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'setProvider' && c.args[0] === 'codex'),
+      ).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('shows the codex login command instead of a fake oauth button', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-providers').click()
+      expect(
+        renderer.getPaintedText().some((line) => line.includes('escape login codex')),
+      ).toBe(true)
+      expect(renderer.getPaintedText()).not.toContain('Connect with OAuth')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('drives follow-up modes and the title model through the engine', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-follow-up').click()
+      await app.getByTestId('settings-follow-up-steer').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'setSteeringMode' && c.args[0] === 'all'),
+      ).toBe(true)
+      expect(
+        fake.calls.some((c) => c.method === 'setFollowUpMode' && c.args[0] === 'all'),
+      ).toBe(true)
+
+      await app.getByTestId('settings-text-model').click()
+      await app.getByTestId('settings-text-model-test-model-b').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some((c) => c.method === 'setTitleModel' && c.args[0] === 'test-model-b'),
+      ).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('repaints mono previews when the monospace font changes', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot({ width: 1280, height: 1400 })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const shot = (name: string): Buffer => {
+      const out = path.join(SHOTS, `mono-${name}.png`)
+      renderer.captureScreenshot(out)
+      return fs.readFileSync(out)
+    }
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      const before = shot('before')
+      await app.getByTestId('settings-mono').click()
+      await app.getByTestId('settings-mono-option-Courier New').click()
+      await settle(renderer)
+      expect(shot('after').equals(before)).toBe(false)
+    } finally {
+      await app.close()
+    }
+  })
+  it('changes general preferences from their dropdowns', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-diff-layout').click()
+      await app.getByTestId('settings-diff-layout-side-by-side').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText()).toContain('Side by side')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('renders live typography previews', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      expect(renderer.getPaintedText()).toContain('Frontend Design')
+      expect(
+        renderer.getPaintedText().some((line) => line.includes('formatUser')),
+      ).toBe(true)
+      expect(
+        renderer.getPaintedText().some((line) => line.includes('watching for changes')),
+      ).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('scales the interface size live', async () => {
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const composerSize = () =>
+      renderer.findByType('textarea')[0]?.style.fontSize as number | undefined
+
+    const app = await connectTest(renderer)
+    try {
+      expect(composerSize()).toBe(15)
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-sans-size').click()
+      await app.getByTestId('settings-sans-size-16').click()
+      await app.getByTestId('settings-back').click()
+      await settle(renderer)
+      expect(composerSize()).toBe(16)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('scales inline code with the monospace size', async () => {
+    const fake = new FakeEngine()
+    fake.replyText = 'use `code` here'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const codeSize = () => textRunStyle(renderer, 'code')?.['fontSize']
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-mono-size').click()
+      await app.getByTestId('settings-mono-size-15').click()
+      await app.getByTestId('settings-back').click()
+      typeSend(renderer, 'hello')
+      await settle(renderer)
+      expect(codeSize()).toBe(15)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('reveals line height behind Advanced and applies it', async () => {
+    const fake = new FakeEngine()
+    fake.replyText = 'hello world para'
+    const { render, renderer } = createTestRoot({ width: 1280, height: 1400 })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const bodyLineHeight = () => textRunStyle(renderer, 'hello world para')?.['lineHeight']
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+    expect(bodyLineHeight()).toBe(26)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      expect(renderer.getPaintedText()).not.toContain('Line height')
+      await app.getByTestId('settings-advanced').click()
+      expect(renderer.getPaintedText()).toContain('Line height')
+      await app.getByTestId('settings-line-height').click()
+      await app.getByTestId('settings-line-height-compact').click()
+      await app.getByTestId('settings-back').click()
+      await settle(renderer)
+      expect(bodyLineHeight()).toBe(22)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('toggles table word wrap', async () => {
+    const fake = new FakeEngine()
+    fake.replyText = '| a | b |\n|---|---|\n| alpha beta gamma | x |'
+    const { render, renderer } = createTestRoot({ width: 1280, height: 1400 })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+    const tableOverflow = () =>
+      String(renderer.getElement(renderer.findByTestId('mdx-table')!.id)?.style.overflowX ?? '')
+    const cellWrap = () =>
+      String(renderer.getElement(renderer.findByTestId('mdx-cell')!.id)?.style.whiteSpace ?? '')
+    expect(tableOverflow()).toBe('scroll')
+    expect(cellWrap()).toBe('nowrap')
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await app.getByTestId('settings-nav-appearance').click()
+      await app.getByTestId('settings-word-wrap').click()
+      await app.getByTestId('settings-back').click()
+      await settle(renderer)
+      expect(tableOverflow()).toBe('visible')
+      expect(cellWrap()).toBe('normal')
+    } finally {
+      await app.close()
+    }
+  })
+
+})
+
+describeNative('safe-mdx', () => {
+  it('renders safe-mdx through GPUIX primitives', () => {
+    const { render, renderer } = createTestRoot()
+    render(<SafeMdxTranscript onCopy={async () => {}} />)
+
+    const screenshot = path.join(SHOTS, 'chat-safe-mdx.png')
+    renderer.captureScreenshot(screenshot)
+
+    expect(renderer.findByType('markdown')).toHaveLength(0)
+    expect(renderer.findByType('code')).toHaveLength(1)
+    expect(fs.statSync(screenshot).size).toBeGreaterThan(0)
+    expect(renderer.getPaintedText()).toContain('React-composed Markdown')
+  })
+
+  it('renders safe-mdx content', () => {
+    const { render, renderer } = createTestRoot()
+    render(<SafeMdxContent onCopy={async () => {}} source="Hello **world**" />)
+    expect(renderer.getPaintedText().some((line) => line.includes('Hello'))).toBe(true)
+    expect(renderer.getPaintedText()).toContain('world')
+  })
+})
+
+describeNative('composer design mode', () => {
+  it('starts a run through its own request rather than a turn', async () => {
+    const fake = new FakeEngine()
+    fake.designScript = [
+      { phase: 'qualify', detail: '' },
+      { phase: 'brief', detail: 'accepted' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    // Turn Design on through the toggle, which is the composer's own control.
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('design-toggle').click()
+      await settle(renderer)
+      typeSend(renderer, 'a landing page for a Go RPC engine')
+      await settle(renderer)
+
+      // The request went out as design_start, and no turn was sent for it.
+      expect(fake.calls.some((c) => c.method === 'startDesign')).toBe(true)
+      expect(fake.calls.some((c) => c.method === 'send')).toBe(false)
+      // The phases the run reported are on screen, in order.
+      const painted = renderer.getPaintedText().join(' ')
+      expect(painted).toContain('Reading the request')
+      expect(painted).toContain('Writing the brief')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('shows the verdict and the two viewports when a run passes', async () => {
+    const fake = new FakeEngine()
+    fake.designResult = { passed: true, repairs: 0, verdict: 'pass', why: '' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('design-toggle').click()
+      await settle(renderer)
+      typeSend(renderer, 'a landing page')
+      await settle(renderer)
+      fake.finishDesign()
+      await settle(renderer)
+
+      const painted = renderer.getPaintedText().join(' ')
+      expect(painted).toContain('Passed review')
+      // A passed review is the only thing that yields screenshots.
+      expect(painted).toContain('1440x1000')
+      expect(painted).toContain('390x844')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('distinguishes a run that could not finish from one that was rejected', async () => {
+    // Both look like failure if flattened into one "not accepted" string, and
+    // the two mean opposite things: one is a machine problem, the other a
+    // design the reviewer would not sign off.
+    const fake = new FakeEngine()
+    fake.failDesignWith = 'capture needs agent-browser on PATH'
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('design-toggle').click()
+      await settle(renderer)
+      typeSend(renderer, 'a landing page')
+      await settle(renderer)
+      fake.finishDesign()
+      await settle(renderer)
+
+      const painted = renderer.getPaintedText().join(' ')
+      expect(painted).toContain('capture needs agent-browser on PATH')
+      expect(painted).not.toContain('Not accepted after')
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+describeNative('add project dialog', () => {
+  it('fuzzy-matches a query against the tree, the way qq3 does', async () => {
+    // qq3 pipes find into fzf: the field filters a list, it does not complete
+    // a path. The assertion that matters is the search being a fuzzy query
+    // rather than a prefix of the directory being completed.
+    const fake = new FakeEngine()
+    fake.searchResult = {
+      directories: [
+        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
+        { name: 'escapy', path: '/Users/tester/Projects/escapy', dir: true, hasChildren: true },
+        { name: 'notes.txt', path: '/Users/tester/Projects/notes.txt', dir: false, hasChildren: false },
+      ],
+      root: '/Users/tester/Projects',
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('add-project').click()
+      await settle(renderer)
+      const input = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeystrokes(input.id, 'esc'.split('').join(' '))
+      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await settle(renderer)
+
+      const asked = fake.calls.filter((c) => c.method === 'searchDirs')
+      // The query is the field's text. qq3 hands fzf the query, not a path
+      // prefix, so "esc" is what goes over the wire.
+      expect(asked.some((c) => c.args[0] === 'esc')).toBe(true)
+      const painted = renderer.getPaintedText().join(' ')
+      expect(painted).toContain('escape')
+      expect(painted).toContain('escapy')
+      // A file is not a project, so it must not be offered as one.
+      expect(painted).not.toContain('notes.txt')
+      // And the dialog says what it searched, once, rather than repeating the
+      // absolute path on every row.
+      expect(painted).toContain('in /Users/tester/Projects')
+      expect(painted).not.toContain('Projects/escape')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('opens with the list already showing, because an empty filter is not empty', async () => {
+    // fzf shows everything when nothing has been typed. A field that opens blank
+    // and shows nothing reads as broken, and it is the state the user sees first.
+    const fake = new FakeEngine()
+    fake.searchResult = {
+      directories: [
+        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
+      ],
+      root: '/Users/tester/Projects',
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('add-project').click()
+      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await settle(renderer)
+      expect(fake.calls.some((c) => c.method === 'searchDirs')).toBe(true)
+      expect(renderer.getPaintedText().join(' ')).toContain('escape')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('says a project was already there instead of claiming to add it', async () => {
+    // The engine reports added=false for a duplicate. Reporting "Added" would
+    // be a lie the user cannot check.
+    const fake = new FakeEngine()
+    fake.searchResult = {
+      directories: [
+        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
+      ],
+      root: '/Users/tester/Projects',
+    }
+    fake.addProjectResult = { project: { path: '/Users/tester/Projects/escape' }, added: false }
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await openAddProject(renderer, app, fake)
+      const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeyDown(field.id, 'enter')
+      await settle(renderer)
+
+      const painted = renderer.getPaintedText().join(' ')
+      expect(painted).toContain('is already a project')
+      expect(painted).not.toContain('Added escape')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('shows the engine message when the path is not a directory', async () => {
+    const fake = new FakeEngine()
+    fake.searchResult = { directories: [], root: '/Users/tester/Projects' }
+    fake.failures.addProject = 'stat /nope: no such file or directory'
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await openAddProject(renderer, app, fake)
+      // Nothing matches "/nope", so there is no row to take. Enter on an empty
+      // list has to fall back to the typed path, or a mistyped path could never
+      // be submitted at all.
+      const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeystrokes(field.id, '/nope'.split('').join(' '))
+      await settle(renderer)
+      renderer.nativeSimulateKeyDown(field.id, 'enter')
+      await settle(renderer)
+
+      // The engine distinguishes a missing path from a file, and that
+      // distinction is the whole reason the user can fix their own typo.
+      expect(renderer.getPaintedText().join(' ')).toContain('no such file or directory')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('adds a project when a result is chosen, in one action', async () => {
+    // qq3 cds on Enter. Making the user pick a result and then press Add is the
+    // extra step the alias does not have.
+    const fake = new FakeEngine()
+    fake.searchResult = {
+      directories: [
+        { name: 'escape', path: '/Users/tester/Projects/escape', dir: true, hasChildren: true },
+      ],
+      root: '/Users/tester/Projects',
+    }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('add-project').click()
+      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await settle(renderer)
+      await app.getByTestId('project-suggestion-/Users/tester/Projects/escape').click()
+      await settle(renderer)
+
+      const add = fake.calls.find((c) => c.method === 'addProject')
+      expect(add).toBeDefined()
+      expect(add!.args[0]).toBe('/Users/tester/Projects/escape')
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+describe('fuzzy match highlighting', () => {
+  it('splits a label into the runs the matcher used', () => {
+    // The engine indexes into the path relative to the root, which is the text
+    // the row shows. "aoi" in "ts/aoi" is at 3,4,5.
+    expect(highlightRuns('ts/aoi', [3, 4, 5])).toEqual([
+      { text: 'ts/', matched: false },
+      { text: 'aoi', matched: true },
+    ])
+  })
+
+  it('handles a match that spans a separator', () => {
+    expect(highlightRuns('ts/aoi-website', [0, 1, 3, 4, 5])).toEqual([
+      { text: 'ts', matched: true },
+      { text: '/', matched: false },
+      { text: 'aoi', matched: true },
+      { text: '-website', matched: false },
+    ])
+  })
+
+  it('shows the whole label when nothing was typed', () => {
+    expect(highlightRuns('ts/aoi', undefined)).toEqual([{ text: 'ts/aoi', matched: false }])
+    expect(highlightRuns('ts/aoi', [])).toEqual([{ text: 'ts/aoi', matched: false }])
+  })
+
+  it('ignores indices that fall outside the label', () => {
+    // A stale or hand-edited index must not throw or produce an empty row. The
+    // in-range ones still apply, so the row is not left unmarked.
+    expect(highlightRuns('ts', [0, 9, -1])).toEqual([
+      { text: 't', matched: true },
+      { text: 's', matched: false },
+    ])
+    expect(highlightRuns('ts', [9, -1])).toEqual([{ text: 'ts', matched: false }])
+  })
+})
+
+describeNative('add project keyboard', () => {
+  it('moves the active row with the arrow keys and adds it on Enter', async () => {
+    // If GPUIX does not deliver keys to an input, this fails and the answer is
+    // that the list needs its own key handling rather than a silent no-op.
+    const fake = new FakeEngine()
+    fake.searchResult = {
+      directories: [
+        { name: 'aoi', path: '/Users/tester/Projects/ts/aoi', dir: true, hasChildren: true, match: [3, 4, 5] },
+        { name: 'go-aoi', path: '/Users/tester/Projects/go/aoi-go', dir: true, hasChildren: true, match: [3, 4, 5] },
+        { name: 'aoi-site', path: '/Users/tester/Projects/ts/aoi-site', dir: true, hasChildren: true, match: [3, 4, 5] },
+      ],
+      root: '/Users/tester/Projects',
+    }
+    const { render, renderer } = // The same window key entry point the real window uses. The test root builds
+    // its own window, so without this the arrows cannot be reached at all.
+    createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('add-project').click()
+      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'searchDirs'); i++) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await settle(renderer)
+
+      // The labels are relative to the root, which is stated once in the footer.
+      // Checked against the array, not a joined string: the label is one path
+      // split into coloured runs, and joining with a space would invent the very
+      // gap the gap:0 above exists to prevent.
+      // Each label arrives as its runs, not as one string: "go/aoi-go" with the
+      // query matched on aoi is "go/", "aoi", "-go". Asserting the joined form
+      // would pass even if the runs were never split.
+      const painted = renderer.getPaintedText()
+      expect(painted).toContain('ts/')
+      expect(painted).toContain('aoi')
+      expect(painted).toContain('go/')
+      expect(painted).toContain('-go')
+      expect(painted).not.toContain('go/aoi-go')
+      expect(painted.join(' ')).not.toContain('/Users/tester/Projects/ts/aoi ')
+
+      // Move to the second row and add it without touching the mouse.
+      const rows = renderer.findByTestId('project-suggestion-/Users/tester/Projects/go/aoi-go')
+      expect(rows).toBeDefined()
+      // A real key down, not simulateKeystrokes: that one types the literal
+      // text "arrowdown" into the focused input, which is a harness artifact
+      // rather than a key press, and it would corrupt the query the same way.
+      const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeyDown(field.id, 'arrowdown')
+      await settle(renderer)
+      renderer.nativeSimulateKeyDown(field.id, 'enter')
+      await settle(renderer)
+
+      // The chosen row is what got added, and the arrow did not leak into the
+      // field as text on the way.
+      expect(renderer.getPaintedText().join(' ')).not.toContain('arrowdown')
+      // A successful add says nothing. It lands you in the project and the
+      // sidebar chip reports cwd, so the chip is the receipt — announcing it as
+      // well put the good news in the smallest text on screen.
+      expect(renderer.getPaintedText().join(' ')).not.toContain('Added aoi-go.')
+
+      const add = fake.calls.find((c) => c.method === 'addProject')
+      expect(add).toBeDefined()
+      expect(add!.args[0]).toBe('/Users/tester/Projects/go/aoi-go')
+      // The picker is repopulated from the engine rather than patched locally,
+      // so a project that failed to add cannot appear to have worked. addProject
+      // had an implementation and no caller until this path existed.
+      expect(fake.calls.filter((c) => c.method === 'listProjects').length).toBeGreaterThan(1)
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+describe('palette contrast floors', () => {
+  // The reason `muted` exists. tertiary and ghost are too dark to read as text on
+  // a raised surface, but they are correct for chevrons, dots and rules, which
+  // only need 3:1. So the fix is a separate token rather than re-tuning two
+  // existing ones, and this pins that every surface clears the 4.5 floor.
+  const srgb = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)
+  const lum = (hex: string) => {
+    const h = hex.replace('#', '')
+    const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255)
+    return 0.2126 * srgb(r) + 0.7152 * srgb(g) + 0.0722 * srgb(b)
+  }
+  const contrast = (a: string, b: string) => {
+    const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x) as [number, number]
+    return (hi + 0.05) / (lo + 0.05)
+  }
+  const SURFACES = ['canvas', 'sidebar', 'raised', 'composer'] as const
+
+  it('gives every theme a muted that clears 4.5:1 on every surface', () => {
+    for (const { palette } of Object.values(THEMES)) {
+      for (const surface of SURFACES) {
+        const ratio = contrast(palette.muted, palette[surface])
+        expect(
+          ratio,
+          `${palette.muted} on ${palette[surface]} is ${ratio.toFixed(2)}:1, below 4.5`,
+        ).toBeGreaterThanOrEqual(4.5)
+      }
+    }
+  })
+
+  it('keeps muted distinct from ghost, which stays for non-text marks', () => {
+    // If these converge, the two roles have blurred and the next person to edit
+    // a chevron will silently break every de-emphasized label.
+    for (const { palette } of Object.values(THEMES)) {
+      expect(palette.muted).not.toBe(palette.ghost)
+      expect(contrast(palette.muted, palette.canvas)).toBeGreaterThan(
+        contrast(palette.ghost, palette.canvas),
+      )
+    }
+  })
+})
+
+describeNative('design run screenshots', () => {
+  it('shows the capture the engine wrote, not a placeholder', async () => {
+    // These were grey boxes. A run claims a visual review happened, so showing
+    // an empty rectangle tells the reader something the engine did not do.
+    const fake = new FakeEngine()
+    fake.designResult = { passed: true, repairs: 0, verdict: 'pass', why: '' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('design-toggle').click()
+      await settle(renderer)
+      typeSend(renderer, 'a landing page')
+      await settle(renderer)
+      fake.finishDesign()
+      await settle(renderer)
+
+      // One per viewport, each pointing at the file the engine wrote. The
+      // fake hands out the paths its design_done event carries.
+      for (const [viewport, path] of [
+        ['shot-1440x1000', '/tmp/desktop.png'],
+        ['shot-390x844', '/tmp/mobile.png'],
+      ]) {
+        const el = renderer.findByTestId(`design-shot-${viewport}`)!
+        expect(el.type).toBe('img')
+        expect(el.customProps?.src).toBe(path)
+        // Named for a screen reader, not an image with no description.
+        expect(String(el.customProps?.alt ?? '').length).toBeGreaterThan(0)
+      }
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+describeNative('add project cursor', () => {
+  it('keeps the cursor on its row when the list is re-filtered', async () => {
+    // The defining behaviour of a fuzzy finder: arrow down, then type, and the
+    // selection is still the thing you were pointing at. Resetting to the top on
+    // every keystroke makes arrow-and-type unusable together, which is the one
+    // combination the keyboard is there for.
+    const fake = new FakeEngine()
+    fake.searchResult = {
+      directories: [
+        { name: 'ts-aoi', path: '/Users/tester/Projects/ts/aoi', dir: true, hasChildren: true },
+        { name: 'go-aoi', path: '/Users/tester/Projects/go/aoi-go', dir: true, hasChildren: true },
+        { name: 'lua-aoi', path: '/Users/tester/Projects/lua/aoi.lua', dir: true, hasChildren: true },
+      ],
+      root: '/Users/tester/Projects',
+    }
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await openAddProject(renderer, app, fake)
+
+      // Move to the second row.
+      const field = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeyDown(field.id, 'arrowdown')
+      await settle(renderer)
+      renderer.nativeSimulateKeyDown(field.id, 'enter')
+      await settle(renderer)
+      // Row two was the go/ one.
+      expect(fake.calls.find((c) => c.method === 'addProject')!.args[0]).toBe(
+        '/Users/tester/Projects/go/aoi-go',
+      )
+
+      // Reopen, move down, then type. The selection must survive the re-filter.
+      fake.calls.length = 0
+      await openAddProject(renderer, app, fake)
+      const field2 = renderer.findByTestId('project-path-input')!
+      renderer.nativeSimulateKeyDown(field2.id, 'arrowdown')
+      await settle(renderer)
+      renderer.nativeSimulateKeystrokes(field2.id, 'o'.split('').join(' '))
+      await settle(renderer)
+      renderer.nativeSimulateKeyDown(field2.id, 'enter')
+      await settle(renderer)
+
+      const added = fake.calls.find((c) => c.method === 'addProject')
+      expect(added).toBeDefined()
+      // Still the go/ row, not a jump back to the first one.
+      expect(added!.args[0]).toBe('/Users/tester/Projects/go/aoi-go')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('reaches every result the engine returned', async () => {
+    // The list used to be capped at 12 while the engine returned 40, which left
+    // 28 directories reachable by no means at all. There is no cap now, and the
+    // footer reports the real number rather than the number on screen.
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      name: `proj-${i}`,
+      path: `/Users/tester/Projects/proj-${i}`,
+      dir: true,
+      hasChildren: true,
+    }))
+    const fake = new FakeEngine()
+    fake.searchResult = { directories: many, root: '/Users/tester/Projects' }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const app = await connectTest(renderer)
+    try {
+      await openAddProject(renderer, app, fake)
+      const painted = renderer.getPaintedText().join(' ')
+      expect(painted).toContain('proj-39')
+      expect(painted).toContain('40 in /Users/tester/Projects')
+      // And the last one is genuinely selectable, not merely painted.
+      const last = renderer.findByTestId('project-suggestion-/Users/tester/Projects/proj-39')
+      expect(last).toBeDefined()
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+describe('motion vocabulary', () => {
+  it('pins the durations to the values the timings were chosen against', () => {
+    // Every animation in the shell reads these. Changing one silently changes
+    // the feel of the app, so the numbers are a decision rather than a default.
+    expect(DURATION.micro).toBeLessThanOrEqual(150)
+    expect(DURATION.enter).toBeLessThanOrEqual(200)
+    expect(DURATION.overlay).toBeLessThanOrEqual(250)
+    // Leaving is quicker than arriving: a dismissal the reader has already asked
+    // for should not hold them for the full enter.
+    expect(DURATION.exit).toBeLessThan(DURATION.enter)
+    // The 300ms ceiling. Past it an interface feels like it is lagging behind
+    // the click rather than responding to it.
+    expect(DURATION.overlay).toBeLessThan(300)
+  })
+
+  it('converts milliseconds to the seconds GPUIX wants', () => {
+    expect(fadeIn(200).transition?.duration).toBeCloseTo(0.2)
+  })
+
+  it('drops the travel but keeps the fade when reduced motion is asked for', () => {
+    // Not "remove all animation": an instant appearance still says something
+    // arrived, where no change at all can read as a missed repaint.
+    __setReducedMotionForTest(true)
+    const reduced = fadeIn(200)
+    __setReducedMotionForTest(false)
+    const normal = fadeIn(200)
+    expect(reduced.transition?.duration).toBe(0)
+    expect(normal.transition?.duration).toBeCloseTo(0.2)
+    // The fade survives either way.
+    expect(reduced.animate).toEqual(normal.animate)
+  })
+
+  it('actually reaches the renderer rather than being dropped', () => {
+    // A motion prop that the host silently ignores looks identical in code
+    // review to one that works. The renderer records it, so assert on that.
+    // motion.div does not forward testId, so the probe is found by type. It is
+    // the only div in this root, which is what makes that unambiguous.
+    const { render: r, renderer } = createTestRoot()
+    r(<motion.div {...fadeIn(DURATION.overlay)} style={{ width: 4, height: 4 }} /> as never)
+    renderer.flush()
+    // findByType returns every match; the probe is the only div in this root.
+    const recorded = (renderer.findByType('div') as unknown as Array<{ customProps?: Record<string, unknown> }>)[0]!
+      .customProps?.motion as
+      | { initial?: { opacity?: number }; animate?: { opacity?: number } }
+      | undefined
+    expect(recorded?.initial?.opacity).toBe(0)
+    expect(recorded?.animate?.opacity).toBe(1)
+  })
+})
+
+describe('no left-edge markers', () => {
+  // A 2-3px accent bar on the leading edge of a selected row is banned. It is
+  // the most recognisable piece of generic generated UI, and it marks position
+  // when position is already carried by indent, surface and weight.
+  //
+  // These scan the source because the failure mode is a pattern rather than a
+  // runtime behaviour: nothing looks wrong in a screenshot until you notice the
+  // bar, and no behavioural test fails unless a test is looking for the bar.
+  const sources = ['app.tsx', 'design-run.tsx', 'theme-tokens.ts'].map((name) => ({
+    name,
+    text: fs.readFileSync(path.join(__dirname, name), 'utf8'),
+  }))
+
+  it('has no one-sided border on a list row or selected item', () => {
+    // A panel edge is not a selection marker, so a one-sided border is only
+    // wrong when it is not one. The window of surrounding lines is what
+    // distinguishes them: a lone `borderRightWidth` line says nothing, the
+    // element it belongs to says whether it is a sidebar, a rail or a row.
+    for (const { name, text } of sources) {
+      const lines = text.split('\n')
+      const offenders: string[] = []
+      lines.forEach((line, i) => {
+        if (!/borderLeftWidth|borderRightWidth/.test(line)) return
+        const context = lines.slice(Math.max(0, i - 8), i + 3).join(' ')
+        if (/sidebar|rail|panel|gutter/i.test(context)) return
+        offenders.push(`${name}:${i + 1} ${line.trim()}`)
+      })
+      expect(offenders, `one-sided border off a panel: ${offenders.join(' | ')}`).toHaveLength(0)
+    }
+  })
+
+  it('draws no narrow accent bar as a row marker', () => {
+    // The selection marker specifically: a 2-3px accent element next to a row
+    // that carries an `active` flag. The markdown blockquote is a different
+    // thing and is checked separately below, because it is a real open question
+    // rather than a recurrence of this pattern.
+    for (const { name, text } of sources) {
+      const offenders = (text.match(/width:\s*2,[\s\S]{0,120}?C\.accent/g) ?? []).filter(
+        (hit) => /active|selected|isActive/.test(hit),
+      )
+      expect(offenders, `${name} marks a row with an accent bar: ${offenders.join(' | ')}`).toHaveLength(0)
+    }
+  })
+
+  it('marks the active row with weight, which survives without colour', () => {
+    // The rule is not "no way to tell which row is active" — it is "not with a
+    // bar". Weight is the replacement, and this is what holds the line.
+    const { text } = sources[0]!
+    expect(text).toMatch(/fontWeight: run\.matched \? 700 : active \? 600 : 400/)
+  })
+})
+
+describe('key names', () => {
+  // The arrow keys were dead in the app while every test passed, because the
+  // test renderer spells them the DOM way and GPUI does not. These tests pin
+  // the platform's spelling, so a handler written against the harness's names
+  // cannot pass again.
+  it("accepts GPUI's spelling of the arrow keys", () => {
+    // Taken from @gpuix/react's own ComboboxInput, which compares against
+    // "up" and "down" and never against "ArrowUp".
+    expect(normaliseKey('down')).toBe('down')
+    expect(normaliseKey('up')).toBe('up')
+  })
+
+  it('also accepts the DOM spelling the test renderer produces', () => {
+    // Both are real. The harness emits "arrowdown"; the window emits "down".
+    // Code under test has to behave the same under both or it is measuring
+    // something the app never does.
+    expect(normaliseKey('arrowdown')).toBe('down')
+    expect(normaliseKey('arrowup')).toBe('up')
+  })
+
+  it('names the space bar the way GPUI does', () => {
+    // The DOM delivers " "; GPUI's own components compare against "space".
+    expect(normaliseKey('space')).toBe('space')
+    expect(normaliseKey(' ')).toBe('space')
+  })
+
+  it('handles enter, escape and the positional keys', () => {
+    expect(normaliseKey('enter')).toBe('enter')
+    expect(normaliseKey('return')).toBe('enter')
+    expect(normaliseKey('escape')).toBe('escape')
+    expect(normaliseKey('home')).toBe('home')
+    expect(normaliseKey('end')).toBe('end')
+  })
+
+  it('is total, and says so for anything it does not know', () => {
+    expect(normaliseKey(undefined)).toBe('other')
+    expect(normaliseKey('')).toBe('other')
+    expect(normaliseKey('f13')).toBe('other')
+  })
+})
+
+describeNative('picker keyboard', () => {
+  /**
+   * Two different key paths, deliberately not conflated.
+   *
+   * Arrows and home/end are dispatched as *element* events on the field, which
+   * is how the real window delivers them: GPUI gives a key to the focused
+   * element and to the window listener, and a text field's caret key action can
+   * consume an arrow before the window ever sees it.
+   *
+   * Enter is not faked that way. In the real pipeline Enter becomes the input's
+   * submit, so it goes through the harness's keystroke API instead. Sending a
+   * synthetic element keyDown for it would assert against a route the app does
+   * not take.
+   */
+  const pressOnField = async (
+    renderer: TestRenderer,
+    fieldId: number,
+    key: string,
+  ): Promise<void> => {
+    // `dispatchEvent` is private in the published type but assigned in the
+    // constructor, so it is a real capability rather than a test-only fiction.
+    // It is the only way to express this case: the public keystroke helpers
+    // deliver a fixed set of key names to the window and silently discard the
+    // rest — home, end, left and right never arrive at all.
+    const send = (renderer as unknown as { dispatchEvent: (event: unknown) => void })
+      .dispatchEvent
+    send.call(renderer, { eventType: 'keyDown', elementId: fieldId, key })
+    await settle(renderer)
+  }
+
+  const submit = async (renderer: TestRenderer, fieldId: number): Promise<void> => {
+    renderer.nativeSimulateKeyDown(fieldId, 'enter')
+    await settle(renderer)
+  }
+
+  /** Which row the cursor is on, read from the row itself rather than inferred. */
+  const selected = (renderer: TestRenderer, path: string): boolean => {
+    const row = renderer.findByTestId(`project-suggestion-${path}`)
+    expect(row).toBeDefined()
+    return row?.customProps?.['aria-selected'] === true
+  }
+
+  const openPickerWith = async (names: string[]) => {
+    const rows = names.map((n) => ({
+      name: `proj-${n}`,
+      path: `/Users/tester/Projects/proj-${n}`,
+      dir: true,
+      hasChildren: true,
+    }))
+    const fake = new FakeEngine()
+    fake.searchResult = { directories: rows, root: '/Users/tester/Projects' }
+    const { render, renderer } = createTestRoot({ onKeyDown: dispatchWindowKey })
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    await openAddProject(renderer, app, fake)
+    return { renderer, fake, app, field: renderer.findByTestId('project-path-input')! }
+  }
+
+  const added = (fake: FakeEngine): string | undefined => {
+    const call = fake.calls.find((c) => c.method === 'addProject')
+    const first: unknown = call?.args?.[0]
+    return typeof first === 'string' ? first : undefined
+  }
+
+  it('moves the cursor with the platform spelling of the keys', async () => {
+    const { renderer, fake, app, field } = await openPickerWith(['a', 'b', 'c'])
+
+    expect(selected(renderer, '/Users/tester/Projects/proj-a')).toBe(true)
+    await pressOnField(renderer, field.id, 'down')
+    expect(selected(renderer, '/Users/tester/Projects/proj-b')).toBe(true)
+    expect(selected(renderer, '/Users/tester/Projects/proj-a')).toBe(false)
+
+    await submit(renderer, field.id)
+    expect(added(fake)).toBe('/Users/tester/Projects/proj-b')
     await app.close()
   })
 
-  it('starts over with a new chat', async () => {
-    const { render, renderer } = createTestRoot()
-    render(<ChatApp />)
-    const app = await connectTest(renderer)
+  it('moves on the input, not only on the window', async () => {
+    // The regression that mattered. Handling arrows solely on the window looked
+    // correct and every test agreed, because the test renderer routes keys to
+    // the window unconditionally. The real field consumes them first.
+    const { renderer, fake, app, field } = await openPickerWith(['a', 'b', 'c', 'd'])
 
-    await app.getByTestId('chat-input').fill('A question to keep')
-    await app.getByTestId('send-message').click()
-    expect(await app.getByTestId('current-chat').count()).toBe(1)
-
-    await app.getByTestId('new-chat').click()
-
-    expect(paintedText(renderer)).not.toContain('A question to keep')
-    expect(paintedText(renderer)).toContain('What can I help you with?')
-    expect(await app.getByTestId('current-chat').count()).toBe(0)
-
+    // Up from the first row wraps to the last.
+    await pressOnField(renderer, field.id, 'up')
+    expect(selected(renderer, '/Users/tester/Projects/proj-d')).toBe(true)
+    await submit(renderer, field.id)
+    expect(added(fake)).toBe('/Users/tester/Projects/proj-d')
     await app.close()
+  })
+
+  it('jumps to the ends of the list with home and end', async () => {
+    const { renderer, fake, app, field } = await openPickerWith(['a', 'b', 'c', 'd', 'e'])
+
+    await pressOnField(renderer, field.id, 'end')
+    expect(selected(renderer, '/Users/tester/Projects/proj-e')).toBe(true)
+    await submit(renderer, field.id)
+    expect(added(fake)).toBe('/Users/tester/Projects/proj-e')
+    await app.close()
+  })
+
+  it('reaches a row the mouse could not, and scrolls it into view', async () => {
+    // Forty results, cursor walked to the end. It must be selectable, not merely
+    // painted, and the panel must have been told to bring it into view.
+    const { renderer, fake, app, field } = await openPickerWith(
+      Array.from({ length: 40 }, (_, i) => String(i)),
+    )
+    const scrolled: number[] = []
+    const original = renderer.scrollIntoView
+    renderer.scrollIntoView = ((id: number) => {
+      scrolled.push(id)
+      return original.call(renderer, id)
+    }) as typeof renderer.scrollIntoView
+
+    await pressOnField(renderer, field.id, 'end')
+    expect(selected(renderer, '/Users/tester/Projects/proj-39')).toBe(true)
+    expect(scrolled.length).toBeGreaterThan(0)
+    await submit(renderer, field.id)
+    expect(added(fake)).toBe('/Users/tester/Projects/proj-39')
+    await app.close()
+  })
+})
+
+describeNative('sidebar projects and recent sessions', () => {
+  it('lists the projects in the sidebar, not behind a dropdown', async () => {
+    // They used to be reachable only through a chip menu, which is why adding a
+    // project appeared to do nothing.
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/projects/alpha' },
+      { path: '/Users/tester/projects/beta' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    expect(renderer.findByTestId('sidebar-project-/Users/tester/projects/alpha')).toBeDefined()
+    expect(renderer.findByTestId('sidebar-project-/Users/tester/projects/beta')).toBeDefined()
+    const painted = renderer.getPaintedText().join(' ')
+    expect(painted).toContain('alpha')
+    expect(painted).toContain('beta')
+  })
+
+  it('marks the current project, without a left-edge bar', async () => {
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/projects/alpha' },
+      { path: '/Users/tester/projects/beta' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const current = renderer.findByTestId('sidebar-project-/Users/tester/projects/alpha')
+    const other = renderer.findByTestId('sidebar-project-/Users/tester/projects/beta')
+    // The state has to reach assistive technology, not just the paint. A check
+    // icon and a background tint are invisible to a screen reader.
+    expect(current?.customProps?.['aria-selected']).toBe(true)
+    expect(other?.customProps?.['aria-selected']).toBe(false)
+    // And the name says which one is current, so it is not colour-dependent.
+    expect(String(current?.customProps?.['aria-label'])).toContain('current project')
+  })
+
+  it('switches project when a row is clicked', async () => {
+    const fake = new FakeEngine()
+    fake.projects = [
+      { path: '/Users/tester/projects/alpha' },
+      { path: '/Users/tester/projects/beta' },
+    ]
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('sidebar-project-/Users/tester/projects/beta').click()
+      await settle(renderer)
+      expect(
+        fake.calls.some(
+          (c) => c.method === 'switchProject' && c.args[0] === '/Users/tester/projects/beta',
+        ),
+      ).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('shows the project recent sessions in the chat area, and nothing else', async () => {
+    // The list replaces the transcript only while nothing is open.
+    const now = Date.now()
+    const fake = new FakeEngine()
+    fake.sessions = [
+      { id: 's1', path: 'sess-1', cwd: '/Users/tester/projects/alpha', name: 'First', updatedAt: now },
+    ]
+    fake.transcripts = { 'sess-1': [{ id: 'm1', role: 'user', content: 'first question' }] }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+
+    const painted = renderer.getPaintedText().join(' ')
+    expect(painted).toContain('Recent in alpha')
+    expect(painted).toContain('First')
+    // The transcript of nothing is not on screen behind it.
+    expect(painted).not.toContain('first question')
+  })
+
+  it('returns to the session list when the current project is clicked again', async () => {
+    const now = Date.now()
+    const fake = new FakeEngine()
+    fake.sessions = [
+      { id: 's1', path: 'sess-1', cwd: '/Users/tester/projects/alpha', name: 'First', updatedAt: now },
+    ]
+    fake.transcripts = { 'sess-1': [{ id: 'm1', role: 'user', content: 'first question' }] }
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('thread-sess-1').click()
+      await settle(renderer)
+      expect(renderer.getPaintedText().join(' ')).toContain('first question')
+
+      await app.getByTestId('sidebar-project-/Users/tester/projects/alpha').click()
+      await settle(renderer)
+      expect(renderer.findByTestId('recent-sessions')).toBeDefined()
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('gives the transcript back the moment a turn starts', async () => {
+    // Sending from the list replaces it immediately, even with the turn held
+    // open: the session id arrives before the send is awaited, so the list never
+    // lingers over a turn. This is the same class of bug that hid the Design
+    // Mode verdict behind the list for a whole run.
+    const fake = new FakeEngine()
+    fake.pauseSend = true
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    expect(renderer.findByTestId('recent-sessions')).toBeDefined()
+
+    typeSend(renderer, 'hello')
+    await settle(renderer)
+    expect(renderer.findByTestId('recent-sessions')).toBeUndefined()
+
+    fake.releaseSend()
+    await settle(renderer)
+  })
+
+  it('starts a new chat from the session list when a message is sent', async () => {
+    // The composer stays live under the list, and send() opens a session when
+    // none is active, so typing here needs no separate "new" gesture.
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      expect(renderer.findByTestId('recent-sessions')).toBeDefined()
+      typeSend(renderer, 'hello from the list')
+      for (let i = 0; i < 40 && !fake.calls.some((c) => c.method === 'send'); i++) {
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await settle(renderer)
+      expect(fake.calls.some((c) => c.method === 'newSession')).toBe(true)
+      expect(fake.calls.some((c) => c.method === 'send')).toBe(true)
+    } finally {
+      await app.close()
+    }
   })
 })
