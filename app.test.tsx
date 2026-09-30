@@ -3242,7 +3242,7 @@ describe('engine working directory', () => {
 })
 
 describe('starting directory setting', () => {
-  it('shows the engine\'s value rather than an empty field', async () => {
+  it('shows the engine\'s value, and reads ~/ when nothing is set', async () => {
     const fake = new FakeEngine()
     fake.state = { ...fake.state, defaultProject: '/Users/tester/Projects/alpha' }
     const { render, renderer } = createTestRoot()
@@ -3255,6 +3255,9 @@ describe('starting directory setting', () => {
       const field = renderer.findByTestId('settings-start-dir')
       expect(field).toBeDefined()
       expect(String(field?.customProps?.value)).toBe('/Users/tester/Projects/alpha')
+      // The default is the home folder, and the field says so rather than
+      // sitting blank with the answer hidden.
+      expect(String(field?.customProps?.placeholder)).toBe('~/')
     } finally {
       await app.close()
     }
@@ -3277,6 +3280,30 @@ describe('starting directory setting', () => {
       expect(
         fake.calls.find((c) => c.method === 'setDefaultProject')?.args?.[0],
       ).toBe('/Users/tester/Projects/beta')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('passes a tilde through for the engine to expand', async () => {
+    // "~/Projects/thing" is what a person writes. Expanding it here would need a
+    // second implementation of the same rule, and the engine already owns it.
+    const fake = new FakeEngine()
+    const { render, renderer } = createTestRoot()
+    render(<ChatApp client={fake} />)
+    await settle(renderer)
+    const app = await connectTest(renderer)
+    try {
+      await app.getByTestId('settings').click()
+      await settle(renderer)
+      const field = renderer.findByTestId('settings-start-dir')!
+      renderer.nativeSimulateKeystrokes(field.id, '~/Projects/beta'.split('').join(' '))
+      await settle(renderer)
+      await app.getByTestId('settings-start-dir-apply').click()
+      await settle(renderer)
+      expect(fake.calls.find((c) => c.method === 'setDefaultProject')?.args?.[0]).toBe(
+        '~/Projects/beta',
+      )
     } finally {
       await app.close()
     }

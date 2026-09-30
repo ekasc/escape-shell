@@ -10,6 +10,7 @@
  * Slow CPU: THROTTLE=utility bun --hot chat.tsx
  */
 
+import os from 'os'
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { C, type Palette } from './theme-tokens'
 import { normaliseKey } from './keys'
@@ -2484,12 +2485,33 @@ function SettingsScreen({
   startDirError: string
 }) {
   const [section, setSection] = useState<SettingsSectionId>('general')
+  const [lastStartDir, setLastStartDir] = useState(startDir)
   const [query, setQuery] = useState('')
   const [goKey, setGoKey] = useState('')
   const [zenKey, setZenKey] = useState('')
+  // "~" for the home folder, so a value under the home directory reads as the
+  // short form a person would type. It is a display form only: what gets written
+  // is the expanded path, and the engine expands a tilde on the way in.
+  const homeDir = os.homedir()
+  const displayStartDir = (value: string): string => {
+    const trimmed = value.trim()
+    if (trimmed === '') return '~/'
+    if (trimmed === homeDir) return '~/'
+    if (trimmed.startsWith(homeDir + '/')) return '~' + trimmed.slice(homeDir.length)
+    return trimmed
+  }
+  // The draft is the real value, so it starts empty at the default. Putting "~/"
+  // in the value instead would mean typing appended to it.
   const [startDraft, setStartDraft] = useState(startDir)
   const [epUrl, setEpUrl] = useState('')
   const [epKey, setEpKey] = useState('')
+  // A value that changed underneath, from the engine applying it or from a reset
+  // elsewhere, replaces the draft. Otherwise the field would show a directory
+  // that is no longer the one in force.
+  if (startDir !== lastStartDir) {
+    setLastStartDir(startDir)
+    setStartDraft(startDir)
+  }
   const activeLabel = SETTINGS_SECTIONS.find((s) => s.id === section)?.label ?? section
   const q = query.trim().toLowerCase()
   const match = (label: string, description?: string) =>
@@ -2687,11 +2709,7 @@ function SettingsScreen({
                 {match('Starting directory', 'where a session opens') && (
                   <SettingsRow
                     label="Starting directory"
-                    description={
-                      startDir === ''
-                        ? 'A session opens in your home folder. Set a directory to open there instead.'
-                        : 'A session opens here when the app is launched.'
-                    }
+                    description={`A session opens in ${displayStartDir(startDir)} when the app is launched.`}
                     control={
                       <div
                         style={{
@@ -2705,7 +2723,8 @@ function SettingsScreen({
                         <input
                           testId="settings-start-dir"
                           value={startDraft}
-                          placeholder="Home folder"
+                          placeholder="~/"
+                          aria-label="Starting directory"
                           theme={currentTheme()}
                           onChange={(event) => setStartDraft(event.value ?? '')}
                           onSubmit={() => onStartDir(startDraft)}
